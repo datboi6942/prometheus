@@ -1,4 +1,6 @@
 import os
+import re
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -83,6 +85,7 @@ class MCPTools:
         """
         try:
             full_path = self._validate_path(path)
+            file_existed = full_path.exists()
             full_path.parent.mkdir(parents=True, exist_ok=True)
 
             with open(full_path, "w", encoding="utf-8") as f:
@@ -92,7 +95,7 @@ class MCPTools:
                 "success": True,
                 "path": path,
                 "size": len(content),
-                "action": "created" if not full_path.exists() else "modified",
+                "action": "modified" if file_existed else "created",
             }
         except Exception as e:
             return {"error": str(e)}
@@ -110,10 +113,26 @@ class MCPTools:
         Returns:
             dict[str, Any]: Execution result.
         """
-        # Security: Block dangerous commands
-        dangerous_keywords = ["rm -rf /", "dd if=", ":(){ :|:& };:", "mkfs", "format"]
-        if any(keyword in command.lower() for keyword in dangerous_keywords):
+        # Security: Block dangerous command patterns using regex
+        dangerous_patterns = [
+            r'rm\s+-rf\s+/',  # rm -rf /
+            r'rm\s+-fr\s+/',  # rm -fr / (alternate flag order)
+            r'rm\s+-rf\s+/\*',  # rm -rf /*
+            r':\(\)\{.*\}',  # Fork bomb
+            r'dd\s+if=',  # Disk destruction
+            r'mkfs\s+',  # Format filesystem
+            r'format\s+',  # Format command
+            r'>\s*/dev/sd',  # Write to block device
+            r'wget.*\|.*sh',  # Download and pipe to shell
+            r'curl.*\|.*sh',  # Download and pipe to shell
+        ]
+        if any(re.search(pattern, command, re.IGNORECASE) for pattern in dangerous_patterns):
             return {"error": "Command blocked for security reasons", "command": command}
+
+        # Security: Block shell metacharacters to prevent command injection
+        dangerous_chars = [';', '|', '&&', '||', '`', '$', '(', ')', '<', '>']
+        if any(char in command for char in dangerous_chars):
+            return {"error": "Command contains unsafe characters", "command": command}
 
         if dry_run:
             return {"dry_run": True, "command": command, "status": "would_execute"}
@@ -123,9 +142,15 @@ class MCPTools:
             if cwd:
                 work_dir = self._validate_path(cwd)
 
+            # Security: Use shell=False with shlex.split() to prevent injection
+            # This only allows single commands, not pipes/redirections
+            command_parts = shlex.split(command)
+            if not command_parts:
+                return {"error": "Empty command", "command": command}
+
             result = subprocess.run(
-                command,
-                shell=True,
+                command_parts,
+                shell=False,
                 cwd=str(work_dir),
                 capture_output=True,
                 text=True,

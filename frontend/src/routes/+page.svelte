@@ -9,7 +9,7 @@
 	let selectedModel = 'ollama/llama3.2';
 	let customEndpoint = '';
 	let customApiKey = '';
-	let workspacePath = '/home/john/prometheus_workspace';
+	let workspacePath = '/tmp/prometheus_workspace';
 	let verboseMode = false;
 	let showSettings = false;
 	let activeView = 'chat'; // 'chat', 'forge'

@@ -40,6 +40,8 @@ def get_mcp_tools(workspace: str | None = None) -> MCPTools:
 def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
     """Extract tool calls from model response with their positions.
     
+    Uses proper JSON parsing that handles braces inside string literals.
+    
     Returns list of tuples: (tool_call_dict, start_index, end_index)
     """
     tool_calls = []
@@ -48,27 +50,37 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
     while i < len(text):
         # Look for {"tool"
         if text[i:i+7] == '{"tool"':
-            # Try to find matching closing brace
             start = i
-            brace_count = 0
             j = i
+            brace_count = 0
+            in_string = False
+            escape_next = False
             
             while j < len(text):
-                if text[j] == '{':
-                    brace_count += 1
-                elif text[j] == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        # Found complete JSON
-                        json_str = text[start:j+1]
-                        try:
-                            tool_call = json.loads(json_str)
-                            if "tool" in tool_call and "args" in tool_call:
-                                tool_calls.append((tool_call, start, j+1))
-                        except json.JSONDecodeError:
-                            pass
-                        i = j
-                        break
+                char = text[j]
+                
+                if escape_next:
+                    escape_next = False
+                elif char == '\\':
+                    escape_next = True
+                elif char == '"' and not escape_next:
+                    in_string = not in_string
+                elif not in_string:
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            # Found complete JSON
+                            json_str = text[start:j+1]
+                            try:
+                                tool_call = json.loads(json_str)
+                                if "tool" in tool_call and "args" in tool_call:
+                                    tool_calls.append((tool_call, start, j+1))
+                            except json.JSONDecodeError:
+                                pass
+                            i = j
+                            break
                 j += 1
         i += 1
     

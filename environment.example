@@ -1,5 +1,7 @@
 # LLM Configuration
-OLLAMA_BASE_URL=http://host.docker.internal:11434
+# For Linux with host networking: use localhost
+# For macOS/Windows with bridge networking: use host.docker.internal
+OLLAMA_BASE_URL=http://localhost:11434
 DEFAULT_MODEL=ollama/llama3.2
 
 # API Keys (Optional)
