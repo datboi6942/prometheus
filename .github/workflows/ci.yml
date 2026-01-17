@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  backend-lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install Poetry
+        run: pip install poetry
+        
+      - name: Install dependencies
+        run: |
+          cd backend
+          poetry install --with dev
+          
+      - name: Run Ruff Check
+        run: |
+          cd backend
+          poetry run ruff check . --fix --exit-zero
+          
+      - name: Run Black Check
+        run: |
+          cd backend
+          poetry run black --check .
+          
+      - name: Run Mypy
+        run: |
+          cd backend
+          poetry run mypy .
+          
+      - name: Run Tests
+        run: |
+          cd backend
+          poetry run pytest -q --cov --cov-branch
