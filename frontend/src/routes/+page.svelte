@@ -9,13 +9,29 @@
 	let selectedModel = 'ollama/llama3.2';
 	let customEndpoint = '';
 	let customApiKey = '';
+	let workspacePath = '/tmp/prometheus_workspace';
+	let verboseMode = false;
 	let showSettings = false;
-	let activeView = 'chat'; // 'chat', 'forge', 'terminal'
+	let activeView = 'chat'; // 'chat', 'forge'
+	let showTerminalPanel = false; // Bottom terminal panel
 	let isConnected = false;
 	let isLoading = false;
 	let chatInput = '';
+	let abortController: AbortController | null = null;
 	let terminalElement: HTMLElement;
 	let editorElement: HTMLElement;
+	let terminalInstance: any = null;
+	
+	// Tool executions log
+	let toolExecutions: Array<{
+		type: string, 
+		path?: string, 
+		command?: string, 
+		stdout?: string,
+		stderr?: string,
+		status: string, 
+		timestamp: Date
+	}> = [];
 	
 	// Chat messages
 	let messages = [
@@ -35,13 +51,14 @@
 		messages = [...messages, { role: 'assistant', content: text, timestamp: new Date() }];
 	}
 
-	async function sendMessage() {
-		if (!chatInput.trim()) return;
+					async function sendMessage() {
+		if (!chatInput.trim() || !workspacePath) return;
 		
 		const userMessage = chatInput;
 		messages = [...messages, { role: 'user', content: userMessage, timestamp: new Date() }];
 		chatInput = '';
 		isLoading = true;
+		abortController = new AbortController();
 
 		if (selectedModel === 'custom' && !customEndpoint) {
 			addLog('Error: Custom endpoint URL is required');
@@ -53,11 +70,13 @@
 			const response = await fetch('http://localhost:8000/api/v1/chat/stream', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
+				signal: abortController.signal,
 				body: JSON.stringify({
 					model: selectedModel,
 					messages: messages.map(m => ({ role: m.role, content: m.content })),
 					api_base: customEndpoint || null,
-					api_key: customApiKey || null
+					api_key: customApiKey || null,
+					workspace_path: workspacePath
 				})
 			});
 
@@ -83,6 +102,7 @@
 						if (dataStr === '[DONE]') {
 							isLoading = false;
 							isConnected = true;
+							abortController = null;
 							break;
 						}
 
@@ -92,6 +112,36 @@
 								currentResponse += data.token;
 								messages[messages.length - 1].content = currentResponse;
 								messages = [...messages];
+							}
+							if (data.tool_execution) {
+								// Log tool execution with output
+								const exec = {
+									type: data.tool_execution.tool || data.tool_execution.action || 'execute',
+									path: data.tool_execution.path,
+									command: data.tool_execution.command,
+									stdout: data.tool_execution.stdout,
+									stderr: data.tool_execution.stderr,
+									status: data.tool_execution.success ? 'success' : 'error',
+									timestamp: new Date()
+								};
+								toolExecutions = [...toolExecutions, exec];
+								
+								// Auto-show terminal panel for shell commands
+								if (exec.type === 'shell_execute' && exec.command) {
+									showTerminalPanel = true;
+								}
+								
+								// Write to terminal if available
+								if (terminalInstance && exec.command) {
+									terminalInstance.writeln(`\r\n\x1b[1;33m$ ${exec.command}\x1b[0m`);
+									if (exec.stdout) {
+										terminalInstance.writeln(exec.stdout);
+									}
+									if (exec.stderr) {
+										terminalInstance.writeln(`\x1b[1;31m${exec.stderr}\x1b[0m`);
+									}
+									terminalInstance.write('prometheus@agent:~$ ');
+								}
 							}
 							if (data.error) {
 								messages[messages.length - 1].content = `Error: ${data.error}`;
@@ -103,10 +153,22 @@
 					}
 				}
 			}
-		} catch (err) {
-			addLog(`Connection failed: ${err}`);
+		} catch (err: any) {
+			if (err.name === 'AbortError') {
+				addLog('Generation cancelled by user');
+			} else {
+				addLog(`Connection failed: ${err}`);
+			}
 			isConnected = false;
 		} finally {
+			isLoading = false;
+			abortController = null;
+		}
+	}
+
+	function stopGeneration() {
+		if (abortController) {
+			abortController.abort();
 			isLoading = false;
 		}
 	}
@@ -133,6 +195,8 @@
 			cursorBlink: true
 		});
 		term.open(terminalElement);
+		terminalInstance = term;
+		
 		term.writeln('\x1b[1;36m╔═══════════════════════════════════════════════════╗\x1b[0m');
 		term.writeln('\x1b[1;36m║       PROMETHEUS HEARTH TERMINAL v0.1.0          ║\x1b[0m');
 		term.writeln('\x1b[1;36m╚═══════════════════════════════════════════════════╝\x1b[0m');
@@ -189,9 +253,9 @@ if __name__ == "__main__":
 		</button>
 		
 		<button 
-			on:click={() => activeView = 'terminal'}
-			class="nav-btn {activeView === 'terminal' ? 'active' : ''}"
-			title="Terminal">
+			on:click={() => showTerminalPanel = !showTerminalPanel}
+			class="nav-btn {showTerminalPanel ? 'active' : ''}"
+			title="Toggle Terminal">
 			<TerminalIcon class="w-5 h-5" />
 		</button>
 
@@ -284,6 +348,30 @@ if __name__ == "__main__":
 				
 				<div class="space-y-5">
 					<div>
+						<label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Workspace Path (Required)</label>
+						<input 
+							type="text" 
+							bind:value={workspacePath}
+							placeholder="/home/john/my_project"
+							class="w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:border-amber-500 focus:ring-1 focus:ring-amber-500 outline-none transition-all font-mono"
+						/>
+						<p class="text-[10px] text-slate-500 mt-1.5 italic">Directory where the agent will create/modify files</p>
+					</div>
+
+					<div class="flex items-center justify-between p-3 bg-slate-950 rounded-lg border border-slate-700">
+						<div>
+							<label class="block text-[10px] font-bold text-slate-400 uppercase">Verbose Mode</label>
+							<p class="text-[9px] text-slate-500 mt-0.5">Show internal tool calls and debug info</p>
+						</div>
+						<button 
+							on:click={() => verboseMode = !verboseMode}
+							class="relative w-12 h-6 rounded-full transition-colors {verboseMode ? 'bg-amber-500' : 'bg-slate-700'}"
+						>
+							<div class="absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform {verboseMode ? 'translate-x-6' : ''}"></div>
+						</button>
+					</div>
+
+					<div>
 						<label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Custom Endpoint URL</label>
 						<input 
 							type="text" 
@@ -322,7 +410,7 @@ if __name__ == "__main__":
 		<div class="flex-1 flex overflow-hidden">
 			
 			<!-- Chat View -->
-			{#if activeView === 'chat'}
+			<div class="flex-1 flex" class:hidden={activeView !== 'chat'}>
 				<div class="flex-1 flex flex-col">
 					<!-- Messages -->
 					<div class="flex-1 overflow-y-auto p-6 space-y-4">
@@ -367,24 +455,77 @@ if __name__ == "__main__":
 							<input 
 								type="text"
 								bind:value={chatInput}
-								on:keydown={(e) => e.key === 'Enter' && sendMessage()}
+								on:keydown={(e) => e.key === 'Enter' && !isLoading && sendMessage()}
 								placeholder="Ask Prometheus anything..."
 								class="flex-1 bg-slate-800/50 border border-slate-700/50 rounded-xl px-4 py-3 text-sm focus:border-amber-500 focus:ring-1 focus:ring-amber-500 outline-none transition-all placeholder-slate-500"
 								disabled={isLoading}
 							/>
-							<button 
-								on:click={sendMessage}
-								disabled={isLoading || !chatInput.trim()}
-								class="px-6 py-3 rounded-xl font-bold text-sm bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 active:scale-95 transition-all shadow-lg shadow-amber-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
-							>
-								Send
-							</button>
+							{#if isLoading}
+								<button 
+									on:click={stopGeneration}
+									class="px-6 py-3 rounded-xl font-bold text-sm bg-red-500 hover:bg-red-600 active:scale-95 transition-all shadow-lg shadow-red-500/30"
+								>
+									<X class="w-4 h-4 inline mr-2" />
+									Stop
+								</button>
+							{:else}
+								<button 
+									on:click={sendMessage}
+									disabled={!chatInput.trim() || !workspacePath}
+									class="px-6 py-3 rounded-xl font-bold text-sm bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 active:scale-95 transition-all shadow-lg shadow-amber-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
+								>
+									Send
+								</button>
+							{/if}
 						</div>
+						{#if !workspacePath}
+							<div class="mt-2 flex items-center gap-2 text-xs text-amber-400">
+								<AlertCircle class="w-3 h-3" />
+								<span>Please set your workspace path in Settings first</span>
+							</div>
+						{/if}
 					</div>
 				</div>
 
-				<!-- Side Panel: Files -->
+				<!-- Side Panel: Tool Executions & Files -->
 				<aside class="w-80 border-l border-slate-800/50 bg-slate-900/20 backdrop-blur-xl flex flex-col">
+					<div class="p-4 border-b border-slate-800/50">
+						<div class="flex items-center gap-2 mb-3">
+							<Zap class="w-4 h-4 text-amber-500" />
+							<span class="text-sm font-bold text-slate-300">Tool Activity</span>
+						</div>
+						{#if toolExecutions.length > 0}
+							<div class="space-y-2 max-h-64 overflow-y-auto">
+								{#each toolExecutions.slice(-10) as exec}
+									<div class="bg-slate-800/30 rounded-lg px-3 py-2 border border-slate-700/50">
+										<div class="flex items-center gap-2 mb-1">
+											{#if exec.status === 'success'}
+												<Check class="w-3 h-3 text-green-500 flex-shrink-0" />
+											{:else}
+												<AlertCircle class="w-3 h-3 text-red-500 flex-shrink-0" />
+											{/if}
+											<div class="text-[10px] font-bold text-slate-400 uppercase">{exec.type}</div>
+											<div class="text-[9px] text-slate-600 ml-auto">{exec.timestamp.toLocaleTimeString()}</div>
+										</div>
+										<div class="text-xs text-slate-300 font-mono truncate mb-1">{exec.path || exec.command}</div>
+										{#if exec.stdout && verboseMode}
+											<div class="mt-2 p-2 bg-slate-900/50 rounded text-[10px] text-green-400 font-mono max-h-20 overflow-y-auto">
+												{exec.stdout}
+											</div>
+										{/if}
+										{#if exec.stderr && verboseMode}
+											<div class="mt-2 p-2 bg-slate-900/50 rounded text-[10px] text-red-400 font-mono max-h-20 overflow-y-auto">
+												{exec.stderr}
+											</div>
+										{/if}
+									</div>
+								{/each}
+							</div>
+						{:else}
+							<div class="text-xs text-slate-500 italic">No tool executions yet</div>
+						{/if}
+					</div>
+					
 					<div class="p-4 border-b border-slate-800/50 flex items-center justify-between">
 						<div class="flex items-center gap-2">
 							<FolderOpen class="w-4 h-4 text-slate-400" />
@@ -408,30 +549,36 @@ if __name__ == "__main__":
 						{/each}
 					</div>
 				</aside>
-			{/if}
+			</div>
 
-			<!-- Forge View -->
-			{#if activeView === 'forge'}
-				<div class="flex-1 flex flex-col">
-					<div class="h-10 border-b border-slate-800/50 bg-slate-900/20 flex items-center px-4 gap-2">
-						<FileCode class="w-4 h-4 text-amber-500" />
-						<span class="text-xs font-medium text-slate-400">workspace.py</span>
-					</div>
-					<div bind:this={editorElement} class="flex-1"></div>
+			<!-- Forge View (always in DOM, hidden when not active) -->
+			<div class="flex-1 flex flex-col" class:hidden={activeView !== 'forge'}>
+				<div class="h-10 border-b border-slate-800/50 bg-slate-900/20 flex items-center px-4 gap-2">
+					<FileCode class="w-4 h-4 text-amber-500" />
+					<span class="text-xs font-medium text-slate-400">The Forge - Code Editor</span>
 				</div>
-			{/if}
+				<div bind:this={editorElement} class="flex-1"></div>
+			</div>
 
-			<!-- Terminal View -->
-			{#if activeView === 'terminal'}
-				<div class="flex-1 flex flex-col bg-[#0a0e1a]">
-					<div class="h-10 border-b border-slate-800/50 bg-slate-900/20 flex items-center px-4 gap-2">
-						<TerminalIcon class="w-4 h-4 text-green-500" />
-						<span class="text-xs font-medium text-slate-400">The Hearth</span>
-					</div>
-					<div bind:this={terminalElement} class="flex-1 p-4"></div>
-				</div>
-			{/if}
-
+		</div>
+		
+		<!-- Bottom Terminal Panel (always in DOM, slides up when active) -->
+		<div 
+			class="border-t border-slate-700/50 bg-[#0a0e1a] transition-all duration-300 ease-in-out overflow-hidden"
+			style="height: {showTerminalPanel ? '280px' : '0px'}"
+		>
+			<div class="h-10 border-b border-slate-800/50 bg-slate-900/40 flex items-center px-4 gap-2">
+				<TerminalIcon class="w-4 h-4 text-green-500" />
+				<span class="text-xs font-medium text-slate-400">The Hearth - Command Center</span>
+				<div class="flex-1"></div>
+				<button 
+					on:click={() => showTerminalPanel = false}
+					class="p-1 hover:bg-slate-700/50 rounded transition-colors"
+				>
+					<X class="w-4 h-4 text-slate-400" />
+				</button>
+			</div>
+			<div bind:this={terminalElement} class="h-[230px] p-2"></div>
 		</div>
 	</main>
 </div>

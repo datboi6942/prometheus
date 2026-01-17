@@ -3,16 +3,14 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    ports:
-      - "8000:8000"
+    # Note: Using host networking on Linux for Ollama access
+    # This means backend is accessible at localhost:8000
+    # Port mapping is ignored in host mode
+    network_mode: "host"
     env_file:
       - .env
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - ./backend/prometheus:/app/prometheus
-    networks:
-      - prometheus-network
 
   frontend:
     build:
@@ -22,9 +20,7 @@ services:
       - "3001:3000"
     environment:
       - NODE_ENV=development
-    networks:
-      - prometheus-network
-
-networks:
-  prometheus-network:
-    driver: bridge
+      # Frontend connects to backend via localhost (backend uses host network)
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
