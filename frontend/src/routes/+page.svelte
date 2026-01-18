@@ -1235,15 +1235,17 @@
 									<Loader2 class="w-4 h-4 text-white animate-spin" />
 								</div>
 								<div class="max-w-2xl flex-1 bg-slate-800/50 border border-blue-500/30 rounded-xl p-4">
-									<div class="flex items-center gap-2 mb-2">
+									<div class="flex items-center gap-2">
 										<span class="text-xs font-mono text-blue-400">{toolCall.tool}</span>
 										<span class="text-[10px] px-2 py-0.5 rounded bg-blue-500/20 text-blue-300">
 											Executing...
 										</span>
 									</div>
-									<div class="text-xs text-slate-400 font-mono">
-										{JSON.stringify(toolCall.args, null, 2)}
-									</div>
+									{#if $verboseMode}
+										<div class="text-xs text-slate-400 font-mono mt-2">
+											{JSON.stringify(toolCall.args, null, 2)}
+										</div>
+									{/if}
 								</div>
 							</div>
 						{/each}
