@@ -29,9 +29,11 @@ MODEL_CONTEXT_LIMITS = {
     "claude-3-haiku": 200000,
     "claude-3-5-sonnet": 200000,
     "claude-3-5-haiku": 200000,
-    # DeepSeek models
-    "deepseek-chat": 64000,
-    "deepseek-reasoner": 64000,
+    # DeepSeek models (can handle up to ~171K with extended context)
+    "deepseek-chat": 171000,  # DeepSeek-V2/V3 Chat
+    "deepseek-reasoner": 171000,  # DeepSeek R1
+    "deepseek-v3": 171000,
+    "deepseek-v2": 171000,
     # Google models
     "gemini-pro": 32768,
     "gemini-1.5-pro": 1000000,
@@ -60,6 +62,8 @@ def get_model_context_limit(model: str) -> int:
     Returns:
         int: Maximum context window size in tokens
     """
+    logger.info("Getting context limit for model", model=model)
+
     # Try using LiteLLM's built-in limit detection
     try:
         max_tokens = litellm.get_max_tokens(model)
@@ -72,15 +76,31 @@ def get_model_context_limit(model: str) -> int:
     # Fall back to our configuration
     # Extract base model name (handle "provider/model" format)
     base_model = model.split("/")[-1].lower()
+    model_lower = model.lower()
+    logger.info("Extracted base model name", original=model, base_model=base_model)
 
-    # Check exact match first
+    # Check for DeepSeek models specifically first (high priority)
+    if "deepseek" in model_lower:
+        if "chat" in base_model or "v3" in base_model or "v2" in base_model:
+            logger.info("Matched DeepSeek Chat model", model=model, limit=MODEL_CONTEXT_LIMITS["deepseek-chat"])
+            return MODEL_CONTEXT_LIMITS["deepseek-chat"]
+        elif "reasoner" in base_model or "r1" in base_model:
+            logger.info("Matched DeepSeek Reasoner model", model=model, limit=MODEL_CONTEXT_LIMITS["deepseek-reasoner"])
+            return MODEL_CONTEXT_LIMITS["deepseek-reasoner"]
+
+    # Check exact match
+    if base_model in MODEL_CONTEXT_LIMITS:
+        logger.info("Exact match found", model=model, limit=MODEL_CONTEXT_LIMITS[base_model])
+        return MODEL_CONTEXT_LIMITS[base_model]
+
+    # Check substring match
     for key, limit in MODEL_CONTEXT_LIMITS.items():
-        if key.lower() in base_model or base_model in key.lower():
-            logger.info("Using configured context limit", model=model, limit=limit)
+        if key != "default" and (key.lower() in base_model or base_model in key.lower()):
+            logger.info("Using configured context limit", model=model, matched_key=key, limit=limit)
             return limit
 
     # Default fallback
-    logger.warning("Unknown model, using default limit", model=model, default=MODEL_CONTEXT_LIMITS["default"])
+    logger.warning("Unknown model, using default limit", model=model, base_model=base_model, default=MODEL_CONTEXT_LIMITS["default"])
     return MODEL_CONTEXT_LIMITS["default"]
 
 
