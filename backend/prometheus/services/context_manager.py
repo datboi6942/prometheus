@@ -214,6 +214,7 @@ async def compress_messages(
 
     # Count current tokens
     current_tokens = await count_messages_tokens(messages, model)
+    original_tokens = current_tokens  # Save original count for stats
 
     if current_tokens <= target_tokens:
         logger.info("No compression needed", current_tokens=current_tokens, target=target_tokens)
@@ -283,13 +284,13 @@ async def compress_messages(
 
     stats = {
         "compressed": True,
-        "original_tokens": current_tokens,
+        "original_tokens": original_tokens,
         "current_tokens": final_tokens,
-        "tokens_saved": current_tokens - final_tokens,
+        "tokens_saved": original_tokens - final_tokens,
         "messages_before": len(messages),
         "messages_after": len(compressed_messages),
         "messages_compressed": messages_compressed,
-        "compression_ratio": round(final_tokens / current_tokens, 2) if current_tokens > 0 else 1.0
+        "compression_ratio": round(final_tokens / original_tokens, 2) if original_tokens > 0 else 1.0
     }
 
     logger.info("Compression complete", **stats)
