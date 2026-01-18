@@ -23,7 +23,7 @@
 		memories, mcpServers, availableTools, files, isLoadingFiles,
 		showExplorer, activeExplorerTab, activeView, showTerminalPanel,
 		messages, chatInput, isLoading, isConnected, abortController,
-		currentOpenFile, editorHasUnsavedChanges, toolExecutions,
+		currentOpenFile, editorHasUnsavedChanges, toolExecutions, activeToolCalls,
 		gitStatus, gitBranches, gitCommits, isGitRepo, githubAuthenticated, githubUser,
 		contextInfo
 	} from '$lib/stores';
@@ -580,6 +580,7 @@
 		$messages = [...$messages, { role: 'user', content: userMessage, timestamp: new Date() }];
 		$chatInput = '';
 		$isLoading = true;
+		$activeToolCalls = []; // Clear any previous active tool calls
 		
 		if (!$currentConversationId) {
 			await createNewConversation();
@@ -617,17 +618,32 @@
 					if (line.startsWith('data: ') && line !== 'data: [DONE]') {
 						try {
 							const data = JSON.parse(line.slice(6));
-							
+
 							// Handle our custom token format
 							if (data.token) {
 								currentResponse += data.token;
 								$messages[$messages.length - 1].content = currentResponse;
 								$messages = [...$messages];
 							}
-							
-							// Handle tool execution notifications
+
+							// Handle tool call notifications (tool is being called, not yet executed)
+							if (data.tool_call) {
+								console.log('Tool call initiated:', data.tool_call.tool);
+								$activeToolCalls = [...$activeToolCalls, {
+									tool: data.tool_call.tool,
+									args: data.tool_call.args,
+									timestamp: new Date()
+								}];
+							}
+
+							// Handle tool execution notifications (tool execution completed)
 							if (data.tool_execution) {
 								const te = data.tool_execution;
+
+								// Remove from active tool calls
+								$activeToolCalls = $activeToolCalls.filter(tc => tc.tool !== te.tool);
+
+								// Add to tool executions history
 								$toolExecutions = [...$toolExecutions, {
 									type: te.tool || 'unknown',
 									path: te.path || te.file,
@@ -647,7 +663,7 @@
 									startCodeAnimation(te.path, te.content);
 								}
 							}
-							
+
 							// Handle permission requests
 							if (data.permission_request) {
 								console.log('Permission required:', data.permission_request);
@@ -1160,6 +1176,26 @@
 								</div>
 							</div>
 						{/if}
+
+						<!-- Active Tool Calls (in progress) -->
+						{#each $activeToolCalls as toolCall}
+							<div class="flex gap-3">
+								<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-600 flex items-center justify-center flex-shrink-0">
+									<Loader2 class="w-4 h-4 text-white animate-spin" />
+								</div>
+								<div class="max-w-2xl flex-1 bg-slate-800/50 border border-blue-500/30 rounded-xl p-4">
+									<div class="flex items-center gap-2 mb-2">
+										<span class="text-xs font-mono text-blue-400">{toolCall.tool}</span>
+										<span class="text-[10px] px-2 py-0.5 rounded bg-blue-500/20 text-blue-300">
+											Executing...
+										</span>
+									</div>
+									<div class="text-xs text-slate-400 font-mono">
+										{JSON.stringify(toolCall.args, null, 2)}
+									</div>
+								</div>
+							</div>
+						{/each}
 
 						<!-- Code Animations -->
 						{#each Array.from(activeCodeAnimations.values()) as animation}

@@ -312,22 +312,34 @@ HOW TO USE TOOLS:
 When you need to use a tool, output this JSON format:
 {{"tool": "TOOL_NAME", "args": {{"param": "value"}}}}
 
-After you use a tool, you will receive the results. Then you can explain what happened to the user.
+After you use a tool, you will receive the results automatically. You can then continue with more tool calls if needed, or explain the results to the user.
 
 IMPORTANT GUIDELINES:
 1. For greetings or simple questions - just respond, no tools needed
-2. Only use ONE tool at a time, then wait for results
-3. After seeing tool results, summarize them for the user
-4. Don't repeat tool calls - if you already called a tool, wait for results
+2. Use ONE tool at a time - you will get results automatically, then you can continue
+3. For tasks requiring multiple operations (like deleting multiple files), make sequential tool calls
+4. After each tool result, either make another tool call OR explain the results to the user
+5. Don't repeat tool calls unnecessarily
 
 EXAMPLE FLOW:
 User: "List the files"
 You: I'll list the files for you.
 {{"tool": "filesystem_list", "args": {{"path": ""}}}}
-[You receive results]
+[You receive results automatically]
 You: Here are the files in your directory: [summarize the results]
 
-Remember: Be helpful, be concise, and don't repeat yourself.""".format(tools_text=tools_text)
+EXAMPLE MULTI-STEP FLOW:
+User: "Delete all .txt files"
+You: I'll delete all .txt files. First, let me list them.
+{{"tool": "filesystem_list", "args": {{"path": ""}}}}
+[You receive results showing file1.txt, file2.txt]
+You: {{"tool": "filesystem_delete", "args": {{"path": "file1.txt"}}}}
+[You receive results]
+You: {{"tool": "filesystem_delete", "args": {{"path": "file2.txt"}}}}
+[You receive results]
+You: I've successfully deleted both .txt files.
+
+Remember: Be helpful, be concise, and continue making tool calls until the task is complete.""".format(tools_text=tools_text)
 
     # Inject user-defined rules
     rules_text = await get_enabled_rules_text(request.workspace_path or "")
@@ -385,26 +397,38 @@ Remember: Be helpful, be concise, and don't repeat yourself.""".format(tools_tex
                     if chunk.choices and chunk.choices[0].delta.content:
                         content = chunk.choices[0].delta.content
                         accumulated_response += content
-                        
-                        # Stream text content (check for potential tool calls to pause streaming)
+
+                        # More aggressive buffering to prevent JSON from leaking through
+                        # Check if we're potentially in a tool call by looking for opening braces
+                        # followed by "tool" keyword
                         open_braces = accumulated_response.count('{') - accumulated_response.count('}')
-                        recent_chunk = accumulated_response[max(0, len(accumulated_response) - 50):]
-                        has_tool = '{"tool"' in recent_chunk or '"tool"' in recent_chunk
+                        # Look at a larger window to catch tool calls early
+                        recent_chunk = accumulated_response[max(0, len(accumulated_response) - 100):]
+
+                        # Check for various tool call patterns
+                        has_tool_pattern = (
+                            '{"tool"' in recent_chunk or
+                            '{ "tool"' in recent_chunk or
+                            '"tool":' in recent_chunk or
+                            '"tool" :' in recent_chunk
+                        )
                         has_args = '"args"' in recent_chunk
-                        looks_like_json_start = has_tool and has_args and open_braces > 0
-                        
+
+                        # If we have open braces and see tool/args keywords, we're likely in a tool call
+                        looks_like_json_start = (open_braces > 0 and (has_tool_pattern or has_args))
+
                         if not looks_like_json_start:
-                            # Only strip tool calls if we have a potential complete response
+                            # Only send content if we're confident it's not a tool call
                             new_content = accumulated_response[last_sent_length:]
-                            
+
                             if new_content:
                                 last_sent_length = len(accumulated_response)
                                 data = json.dumps({"token": new_content})
                                 yield f"data: {data}\n\n"
-                
+
                 # Extract tool calls ONCE after streaming completes (not on every chunk!)
                 tool_calls = extract_tool_calls(accumulated_response)
-                
+
                 # Track tool calls
                 for tool_call, start, end in tool_calls:
                     tool_signature = json.dumps(tool_call, sort_keys=True)
@@ -415,16 +439,28 @@ Remember: Be helpful, be concise, and don't repeat yourself.""".format(tools_tex
                             "end": end,
                             "signature": tool_signature
                         })
-                
+
+                        # Send tool call notification to frontend for animation
+                        tool_call_notification = json.dumps({
+                            "tool_call": {
+                                "tool": tool_call.get("tool"),
+                                "args": tool_call.get("args"),
+                            }
+                        })
+                        yield f"data: {tool_call_notification}\n\n"
+
                 # Strip tool calls from the complete response
                 clean_response = strip_tool_calls(accumulated_response)
-                
+
                 # Send any remaining content that wasn't streamed (cleaned)
-                # We need to recalculate what we've sent vs what's clean
-                if tool_calls_found:
-                    # If there were tool calls, send the clean version of what we haven't sent
-                    final_data = json.dumps({"token": "\n"})  # Just a newline to separate
-                    yield f"data: {final_data}\n\n"
+                # Calculate what clean content we haven't sent yet
+                if last_sent_length < len(accumulated_response):
+                    # We have buffered content that wasn't sent (likely due to tool call detection)
+                    # Send the clean version now
+                    remaining_clean = clean_response[min(last_sent_length, len(clean_response)):]
+                    if remaining_clean.strip():
+                        final_data = json.dumps({"token": remaining_clean})
+                        yield f"data: {final_data}\n\n"
                 
                 # Add assistant response to conversation (without tool calls)
                 if clean_response.strip():

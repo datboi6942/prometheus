@@ -99,6 +99,13 @@ export const toolExecutions = writable<Array<{
 	hint?: string;
 }>>([]);
 
+// Active Tool Calls (in progress, not yet executed)
+export const activeToolCalls = writable<Array<{
+	tool: string;
+	args: Record<string, any>;
+	timestamp: Date;
+}>>([]);
+
 // Git State
 export const gitStatus = writable<any>(null);
 export const gitBranches = writable<Array<{name: string, is_current: boolean, is_remote: boolean}>>([]);
