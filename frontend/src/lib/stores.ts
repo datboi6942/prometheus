@@ -51,6 +51,18 @@ export const chatInput = writable('');
 export const isLoading = writable(false);
 export const currentConversationId = writable<string | null>(null);
 
+// Context Window Management
+export const contextInfo = writable<{
+	current_tokens: number;
+	max_tokens: number;
+	usage_ratio: number;
+	compression_needed: boolean;
+	critical: boolean;
+	compressed?: boolean;
+	tokens_saved?: number;
+	compression_ratio?: number;
+} | null>(null);
+
 // Conversations
 export const conversations = writable<Array<{id: string, title: string, updated_at: string}>>([]);
 
