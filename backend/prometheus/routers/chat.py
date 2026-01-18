@@ -7,7 +7,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from prometheus.config import settings
-from prometheus.database import get_enabled_rules_text
+from prometheus.database import (
+    add_memory,
+    get_enabled_rules_text,
+    get_memories_text,
+)
 from prometheus.mcp.tools import MCPTools
 from prometheus.routers.health import get_model_router
 from prometheus.services.model_router import ModelRouter
@@ -100,8 +104,11 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
     
     # Strategy 2: Try to find JSON objects that look like tool calls using simple search
     if not tool_calls:
-        # Look for common tool names
-        tool_names = ["filesystem_write", "filesystem_read", "filesystem_list", "shell_execute"]
+        # Get tool names dynamically from registry
+        from prometheus.services.tool_registry import get_registry
+        
+        registry = get_registry()
+        tool_names = registry.get_tool_names()
         for tool_name in tool_names:
             idx = text.find(f'"tool": "{tool_name}"')
             if idx == -1:
@@ -167,6 +174,62 @@ def strip_tool_calls(text: str) -> str:
     return result.strip()
 
 
+def extract_memory_requests(text: str, source: str = "user") -> list[dict[str, str]]:
+    """Extract memory requests from text.
+    
+    Detects patterns like:
+    - "remember that..." / "remember this..."
+    - "I want you to remember..."
+    - Model-generated memory indicators
+    
+    Args:
+        text: Text to analyze.
+        source: Source of the memory request ('user' or 'model').
+        
+    Returns:
+        list: List of memory dictionaries with 'content' and 'tags'.
+    """
+    memories = []
+    import re
+    
+    # User memory patterns
+    if source == "user":
+        patterns = [
+            r"(?:remember|save|store)\s+(?:that|this|the\s+fact\s+that)\s+(.+?)(?:\.|$)",
+            r"i\s+(?:want\s+you\s+to\s+)?remember\s+(.+?)(?:\.|$)",
+            r"don't\s+forget\s+(?:that|about)\s+(.+?)(?:\.|$)",
+            r"keep\s+in\s+mind\s+(?:that|the\s+fact\s+that)\s+(.+?)(?:\.|$)",
+        ]
+        for pattern in patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            for match in matches:
+                content = match.group(1).strip()
+                if len(content) > 10:  # Minimum length for a meaningful memory
+                    # Extract potential tags from the memory content
+                    words = content.split()[:5]  # First 5 words as tags
+                    tags = ",".join([w.lower().strip(".,!?") for w in words if len(w) > 3])
+                    memories.append({"content": content, "tags": tags})
+    
+    # Model memory patterns (when model decides to remember something)
+    elif source == "model":
+        # Look for explicit memory indicators in model response
+        patterns = [
+            r"\[MEMORY\]:\s*(.+?)(?:\n|$)",
+            r"\[REMEMBER\]:\s*(.+?)(?:\n|$)",
+            r"important\s+to\s+remember:\s*(.+?)(?:\.|$)",
+        ]
+        for pattern in patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            for match in matches:
+                content = match.group(1).strip()
+                if len(content) > 10:
+                    words = content.split()[:5]
+                    tags = ",".join([w.lower().strip(".,!?") for w in words if len(w) > 3])
+                    memories.append({"content": content, "tags": tags})
+    
+    return memories
+
+
 @router.post("/workspace/config")
 async def configure_workspace(config: WorkspaceConfig) -> dict:
     """Configure the workspace path."""
@@ -181,16 +244,30 @@ async def chat_stream(
     """Server-Sent Events endpoint for streaming with tool execution."""
     mcp_tools = get_mcp_tools(request.workspace_path)
 
+    # Get available tools dynamically from registry
+    from prometheus.services.tool_registry import get_registry
+    
+    registry = get_registry()
+    all_tools = registry.get_all_tools()
+    
+    # Build tools list for system prompt
+    tools_list = []
+    for i, tool in enumerate(all_tools, 1):
+        tool_desc = f"{i}. {tool['name']}"
+        if tool.get("description"):
+            tool_desc += f" - {tool['description']}"
+        if tool.get("parameters"):
+            params = ", ".join(tool["parameters"].keys())
+            tool_desc += f"({params})"
+        tools_list.append(tool_desc)
+    
+    tools_text = "\n".join(tools_list) if tools_list else "No tools available"
+
     # Enhanced system prompt for autonomous coding
-    system_prompt = """You are Prometheus, an autonomous AI coding agent. You have tools to create, read, modify, and TEST files.
+    system_prompt = f"""You are Prometheus, an autonomous AI coding agent. You have tools to create, read, modify, and TEST files.
 
 TOOLS AVAILABLE:
-1. filesystem_write(path, content) - Create/modify files
-2. filesystem_read(path) - Read file contents  
-3. filesystem_list(path) - List directory (use path="" for root)
-4. run_python(file_path, stdin_input, args) - Run Python file with optional test input
-5. run_tests(test_path) - Run pytest on test files
-6. shell_execute(command) - Run shell commands (non-interactive only)
+{tools_text}
 
 TOOL FORMAT - Use this exact JSON format:
 {"tool": "TOOL_NAME", "args": {"param": "value"}}
@@ -235,7 +312,16 @@ REMEMBER: Take action immediately. Create testable code with example output."""
 
     # Inject user-defined rules
     rules_text = await get_enabled_rules_text(request.workspace_path or "")
-    full_system_prompt = system_prompt + rules_text
+    
+    # Inject relevant memories based on conversation context
+    # Extract keywords from recent messages for memory relevance
+    context_keywords = " ".join([msg.content[:200] for msg in request.messages[-3:]])
+    memories_text = await get_memories_text(
+        workspace_path=request.workspace_path,
+        context=context_keywords,
+    )
+    
+    full_system_prompt = system_prompt + rules_text + memories_text
 
     messages_with_system = [{"role": "system", "content": full_system_prompt}]
     messages_with_system.extend([msg.model_dump() for msg in request.messages])
@@ -276,26 +362,15 @@ REMEMBER: Take action immediately. Create testable code with example output."""
                         
                         logger.info("Executing tool", tool=tool_name, args=args)
                         
-                        result = None
-                        if tool_name == "filesystem_write":
-                            result = mcp_tools.filesystem_write(
-                                args.get("path", ""),
-                                args.get("content", "")
-                            )
-                        elif tool_name == "filesystem_read":
-                            result = mcp_tools.filesystem_read(args.get("path", ""))
-                        elif tool_name == "filesystem_list":
-                            result = mcp_tools.filesystem_list(args.get("path", ""))
-                        elif tool_name == "run_python":
-                            result = mcp_tools.run_python(
-                                args.get("file_path", ""),
-                                args.get("stdin_input", ""),
-                                args.get("args", "")
-                            )
-                        elif tool_name == "run_tests":
-                            result = mcp_tools.run_tests(args.get("test_path", ""))
-                        elif tool_name == "shell_execute":
-                            result = mcp_tools.shell_execute(args.get("command", ""))
+                        # Use dynamic tool registry
+                        from prometheus.services.tool_registry import get_registry
+                        
+                        registry = get_registry()
+                        result = await registry.execute_tool(
+                            name=tool_name,
+                            args=args,
+                            context={"workspace_path": request.workspace_path, "mcp_tools": mcp_tools},
+                        )
                         
                         logger.info("Tool execution result", result=result)
                         
@@ -324,8 +399,11 @@ REMEMBER: Take action immediately. Create testable code with example output."""
                     open_braces = accumulated_response.count('{') - accumulated_response.count('}')
                     
                     # More aggressive streaming - only hold back if we're actively mid-JSON
+                    # Check for both "tool" and "args" to be more confident it's a tool call
                     recent_chunk = accumulated_response[max(0, len(accumulated_response) - 50):]
-                    looks_like_json_start = '{"tool"' in recent_chunk and open_braces > 0
+                    has_tool = '{"tool"' in recent_chunk or '"tool"' in recent_chunk
+                    has_args = '"args"' in recent_chunk
+                    looks_like_json_start = has_tool and has_args and open_braces > 0
                     
                     if not looks_like_json_start:
                         # Safe to send - strip any tool calls and send new content
@@ -343,6 +421,39 @@ REMEMBER: Take action immediately. Create testable code with example output."""
             if final_content:
                 data = json.dumps({"token": final_content})
                 yield f"data: {data}\n\n"
+
+            # Extract and save memories from the conversation
+            # Check user messages for memory requests
+            for msg in request.messages:
+                if msg.role == "user":
+                    user_memories = extract_memory_requests(msg.content, source="user")
+                    for memory in user_memories:
+                        try:
+                            await add_memory(
+                                content=memory["content"],
+                                source="user",
+                                workspace_path=request.workspace_path,
+                                conversation_id=request.conversation_id,
+                                tags=memory.get("tags"),
+                            )
+                            logger.info("Saved user memory", content=memory["content"][:50])
+                        except Exception as e:
+                            logger.warning("Failed to save memory", error=str(e))
+            
+            # Check model response for memory indicators
+            model_memories = extract_memory_requests(clean_response, source="model")
+            for memory in model_memories:
+                try:
+                    await add_memory(
+                        content=memory["content"],
+                        source="model",
+                        workspace_path=request.workspace_path,
+                        conversation_id=request.conversation_id,
+                        tags=memory.get("tags"),
+                    )
+                    logger.info("Saved model memory", content=memory["content"][:50])
+                except Exception as e:
+                    logger.warning("Failed to save model memory", error=str(e))
 
             yield "data: [DONE]\n\n"
             

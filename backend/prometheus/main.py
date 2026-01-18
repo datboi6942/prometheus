@@ -1,10 +1,15 @@
+from typing import Any
+
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from prometheus.config import settings
-from prometheus.database import init_db
-from prometheus.routers import chat, conversations, files, health
+from prometheus.database import init_db, get_mcp_servers
+from prometheus.mcp.tools import MCPTools
+from prometheus.routers import chat, conversations, files, git, health, mcp
+from prometheus.services.mcp_loader import load_mcp_server_tools
+from prometheus.services.tool_registry import get_registry
 
 # Configure structlog
 structlog.configure(
@@ -41,6 +46,8 @@ app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(files.router)
 app.include_router(conversations.router)
+app.include_router(git.router)
+app.include_router(mcp.router)
 
 
 @app.on_event("startup")
@@ -50,6 +57,70 @@ async def startup_event() -> None:
     # Initialize database
     await init_db()
     logger.info("Database initialized")
+    
+    # Initialize tool registry with fallback tools
+    registry = get_registry()
+    
+    # Register fallback filesystem tools (basic functionality)
+    def create_fallback_handler(tool_method: str):
+        def handler(args: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+            workspace_path = context.get("workspace_path", settings.workspace_path)
+            mcp_tools = MCPTools(workspace_path)
+            method = getattr(mcp_tools, tool_method)
+            return method(**args)
+        return handler
+    
+    # Register basic filesystem tools as fallbacks
+    fallback_tools = {
+        "filesystem_read": ("Read a file from the workspace", {"path": {"type": "string"}}),
+        "filesystem_write": ("Write content to a file", {"path": {"type": "string"}, "content": {"type": "string"}}),
+        "filesystem_list": ("List directory contents", {"path": {"type": "string", "default": ""}}),
+        "filesystem_delete": ("Delete a file or directory", {"path": {"type": "string"}}),
+    }
+    
+    for tool_name, (description, params) in fallback_tools.items():
+        registry.register_fallback_tool(
+            name=tool_name,
+            handler=create_fallback_handler(tool_name),
+            description=description,
+            parameters=params,
+        )
+    
+    # Register other fallback tools
+    registry.register_fallback_tool(
+        name="run_python",
+        handler=create_fallback_handler("run_python"),
+        description="Run a Python file with optional stdin input",
+        parameters={
+            "file_path": {"type": "string"},
+            "stdin_input": {"type": "string", "default": ""},
+            "args": {"type": "string", "default": ""},
+        },
+    )
+    
+    registry.register_fallback_tool(
+        name="run_tests",
+        handler=create_fallback_handler("run_tests"),
+        description="Run pytest on test files",
+        parameters={"test_path": {"type": "string", "default": ""}},
+    )
+    
+    registry.register_fallback_tool(
+        name="shell_execute",
+        handler=create_fallback_handler("shell_execute"),
+        description="Execute a shell command (non-interactive only)",
+        parameters={"command": {"type": "string"}, "cwd": {"type": "string", "default": None}},
+    )
+    
+    logger.info("Registered fallback tools", count=len(registry.get_tool_names()))
+    
+    # Load MCP servers from database
+    mcp_servers = await get_mcp_servers()
+    for server in mcp_servers:
+        if server.get("enabled"):
+            await load_mcp_server_tools(server["name"], server["config"])
+    
+    logger.info("Loaded MCP servers", count=len(mcp_servers))
 
 
 if __name__ == "__main__":

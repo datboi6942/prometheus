@@ -11,6 +11,7 @@ services:
       - .env
     volumes:
       - ./backend/prometheus:/app/prometheus
+      - prometheus_data:/tmp/prometheus_data
 
   frontend:
     build:
@@ -24,3 +25,6 @@ services:
       - VITE_API_URL=http://localhost:8000
     depends_on:
       - backend
+
+volumes:
+  prometheus_data:
