@@ -253,21 +253,21 @@ async def init_db() -> None:
 
 
 async def _migrate_add_thinking_columns(db: aiosqlite.Connection) -> None:
-    """Add thinking_summary and thinking_content columns to messages table if they don't exist."""
+    """Add thinking_summary and thinking_content columns to messages table if they don't exist.
+
+    Note: SQLite ALTER TABLE ADD COLUMN is a fast metadata-only operation that doesn't
+    rewrite the table, so lock time is minimal even for large tables.
+    """
     # Check if columns already exist
     cursor = await db.execute("PRAGMA table_info(messages)")
     columns = await cursor.fetchall()
     column_names = [col[1] for col in columns]
 
-    # Add thinking_summary column if it doesn't exist
+    # Add both columns in sequence (already in init_db transaction)
     if "thinking_summary" not in column_names:
         await db.execute("ALTER TABLE messages ADD COLUMN thinking_summary TEXT")
-
-    # Add thinking_content column if it doesn't exist
     if "thinking_content" not in column_names:
         await db.execute("ALTER TABLE messages ADD COLUMN thinking_content TEXT")
-
-    await db.commit()
 
 
 # Conversation functions

@@ -53,6 +53,22 @@ MODEL_CONTEXT_LIMITS = {
 COMPRESSION_THRESHOLD = 0.80  # Start compressing at 80% usage
 CRITICAL_THRESHOLD = 0.95  # Aggressive compression at 95%
 
+# Reasoning models (output thinking/reasoning content separately from response)
+REASONING_MODEL_PATTERNS = ["reasoner", "r1", "o1", "o3"]
+
+
+def is_reasoning_model(model: str) -> bool:
+    """Check if a model is a reasoning model that streams thinking separately.
+
+    Args:
+        model: Model identifier (e.g., "deepseek/deepseek-reasoner", "ollama/deepseek-r1")
+
+    Returns:
+        bool: True if the model is a reasoning model
+    """
+    model_lower = model.lower()
+    return any(pattern in model_lower for pattern in REASONING_MODEL_PATTERNS)
+
 
 def get_model_context_limit(model: str) -> int:
     """Get the context window limit for a model.

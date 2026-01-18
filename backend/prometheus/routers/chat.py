@@ -16,7 +16,7 @@ from prometheus.database import (
 from prometheus.mcp.tools import MCPTools
 from prometheus.routers.health import get_model_router
 from prometheus.services.model_router import ModelRouter
-from prometheus.services.context_manager import check_and_compress_if_needed
+from prometheus.services.context_manager import check_and_compress_if_needed, model_is_reasoning
 
 router = APIRouter(prefix="/api/v1")
 logger = structlog.get_logger()
@@ -387,9 +387,9 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
                 tool_calls_found = []
 
                 # Detect if this is a reasoning model (streams thinking separately from content)
-                is_reasoning_model = "reasoner" in request.model.lower() or "r1" in request.model.lower()
+                model_is_reasoning = model_is_reasoning(request.model)
 
-                logger.info("Starting model stream", iteration=iteration, message_count=len(current_messages), is_reasoning_model=is_reasoning_model)
+                logger.info("Starting model stream", iteration=iteration, message_count=len(current_messages), model_is_reasoning=model_is_reasoning)
 
                 # Stream model response - buffer entire response to prevent tool JSON from leaking
                 async for chunk in model_router.stream(
@@ -432,7 +432,7 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
 
                             # Stream content immediately for reasoning models (they don't use tools)
                             # Buffer for regular models to extract/strip tool calls
-                            if is_reasoning_model:
+                            if model_is_reasoning:
                                 token_data = json.dumps({"token": content})
                                 yield f"data: {token_data}\n\n"
 
@@ -464,7 +464,7 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
 
                 # Send the clean response (all at once, after stripping tool calls)
                 # Skip this for reasoning models since we already streamed the content
-                if clean_response.strip() and not is_reasoning_model:
+                if clean_response.strip() and not model_is_reasoning:
                     final_data = json.dumps({"token": clean_response})
                     yield f"data: {final_data}\n\n"
                 
