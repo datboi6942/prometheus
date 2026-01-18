@@ -17,7 +17,14 @@ class ModelRouter:
     def __init__(self, config: Settings) -> None:
         self.config = config
         self.model_configs: dict[str, dict[str, Any]] = {
+            # Local models via Ollama
             "ollama/llama3.2": {"api_base": config.ollama_base_url},
+            "ollama/codellama": {"api_base": config.ollama_base_url},
+            "ollama/deepseek-r1": {"api_base": config.ollama_base_url},
+            # DeepSeek API models
+            "deepseek/deepseek-chat": {"api_base": "https://api.deepseek.com"},
+            "deepseek/deepseek-reasoner": {"api_base": "https://api.deepseek.com"},
+            # Commercial providers
             "anthropic/claude-3-5-sonnet-20240620": {},
             "openai/gpt-4o": {},
         }

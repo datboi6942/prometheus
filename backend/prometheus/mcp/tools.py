@@ -100,6 +100,137 @@ class MCPTools:
         except Exception as e:
             return {"error": str(e)}
 
+    def filesystem_list(self, path: str = "") -> dict[str, Any]:
+        """List contents of a directory in the workspace.
+
+        Args:
+            path (str): Relative path within workspace (empty for root).
+
+        Returns:
+            dict[str, Any]: Directory listing with files and subdirectories.
+        """
+        try:
+            if path:
+                full_path = self._validate_path(path)
+            else:
+                full_path = self.workspace_path
+
+            if not full_path.exists():
+                return {"error": f"Directory not found: {path}"}
+
+            if not full_path.is_dir():
+                return {"error": f"Path is not a directory: {path}"}
+
+            items = []
+            for item in sorted(full_path.iterdir()):
+                # Skip hidden files
+                if item.name.startswith("."):
+                    continue
+
+                item_info = {
+                    "name": item.name,
+                    "type": "directory" if item.is_dir() else "file",
+                    "path": str(item.relative_to(self.workspace_path)),
+                }
+
+                if item.is_file():
+                    item_info["size"] = item.stat().st_size
+
+                items.append(item_info)
+
+            return {
+                "success": True,
+                "path": path,
+                "items": items,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def run_python(
+        self, file_path: str, stdin_input: str = "", args: str = ""
+    ) -> dict[str, Any]:
+        """Run a Python file with optional stdin input for testing.
+
+        Args:
+            file_path (str): Path to Python file within workspace.
+            stdin_input (str): Input to provide via stdin (for testing interactive programs).
+            args (str): Command line arguments to pass.
+
+        Returns:
+            dict[str, Any]: Execution result with stdout, stderr, return code.
+        """
+        try:
+            full_path = self._validate_path(file_path)
+            if not full_path.exists():
+                return {"error": f"File not found: {file_path}"}
+
+            cmd = ["python3", str(full_path)]
+            if args:
+                cmd.extend(shlex.split(args))
+
+            result = subprocess.run(
+                cmd,
+                shell=False,
+                cwd=str(self.workspace_path),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                input=stdin_input if stdin_input else None,
+            )
+
+            return {
+                "success": result.returncode == 0,
+                "file": file_path,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "return_code": result.returncode,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "error": "Script timed out after 10 seconds (may need stdin input)",
+                "file": file_path,
+                "hint": "Use stdin_input parameter to provide test input for interactive scripts",
+            }
+        except Exception as e:
+            return {"error": str(e), "file": file_path}
+
+    def run_tests(self, test_path: str = "") -> dict[str, Any]:
+        """Run pytest on test files in the workspace.
+
+        Args:
+            test_path (str): Specific test file or directory (empty for all tests).
+
+        Returns:
+            dict[str, Any]: Test results.
+        """
+        try:
+            cmd = ["python3", "-m", "pytest", "-v", "--tb=short"]
+            if test_path:
+                full_path = self._validate_path(test_path)
+                cmd.append(str(full_path))
+            else:
+                cmd.append(str(self.workspace_path))
+
+            result = subprocess.run(
+                cmd,
+                shell=False,
+                cwd=str(self.workspace_path),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            return {
+                "success": result.returncode == 0,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "return_code": result.returncode,
+            }
+        except subprocess.TimeoutExpired:
+            return {"error": "Tests timed out after 60 seconds"}
+        except Exception as e:
+            return {"error": str(e)}
+
     def shell_execute(
         self, command: str, cwd: str | None = None, dry_run: bool = False
     ) -> dict[str, Any]:

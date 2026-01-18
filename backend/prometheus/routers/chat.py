@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from prometheus.config import settings
+from prometheus.database import get_enabled_rules_text
 from prometheus.mcp.tools import MCPTools
 from prometheus.routers.health import get_model_router
 from prometheus.services.model_router import ModelRouter
@@ -40,18 +41,26 @@ def get_mcp_tools(workspace: str | None = None) -> MCPTools:
 def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
     """Extract tool calls from model response with their positions.
     
-    Uses proper JSON parsing that handles braces inside string literals.
+    Uses multiple strategies to find tool calls in model output.
     
     Returns list of tuples: (tool_call_dict, start_index, end_index)
     """
-    tool_calls = []
-    i = 0
+    import structlog
+    logger = structlog.get_logger()
     
-    while i < len(text):
-        # Look for {"tool"
-        if text[i:i+7] == '{"tool"':
-            start = i
-            j = i
+    tool_calls = []
+    
+    # Strategy 1: Look for {"tool" pattern with regex
+    patterns = [
+        r'\{"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{',  # {"tool": "name", "args": {
+        r'\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{',  # { "tool": "name", "args": {
+    ]
+    
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            start = match.start()
+            # Find the matching closing brace
+            j = start
             brace_count = 0
             in_string = False
             escape_next = False
@@ -61,9 +70,12 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
                 
                 if escape_next:
                     escape_next = False
-                elif char == '\\':
+                    j += 1
+                    continue
+                    
+                if char == '\\':
                     escape_next = True
-                elif char == '"' and not escape_next:
+                elif char == '"':
                     in_string = not in_string
                 elif not in_string:
                     if char == '{':
@@ -76,13 +88,67 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
                             try:
                                 tool_call = json.loads(json_str)
                                 if "tool" in tool_call and "args" in tool_call:
-                                    tool_calls.append((tool_call, start, j+1))
-                            except json.JSONDecodeError:
-                                pass
-                            i = j
+                                    # Check if already found
+                                    already_found = any(tc[1] == start for tc in tool_calls)
+                                    if not already_found:
+                                        logger.info("Found tool call", tool=tool_call.get("tool"), start=start, end=j+1)
+                                        tool_calls.append((tool_call, start, j+1))
+                            except json.JSONDecodeError as e:
+                                logger.warning("JSON decode failed", error=str(e), json_preview=json_str[:100])
                             break
                 j += 1
-        i += 1
+    
+    # Strategy 2: Try to find JSON objects that look like tool calls using simple search
+    if not tool_calls:
+        # Look for common tool names
+        tool_names = ["filesystem_write", "filesystem_read", "filesystem_list", "shell_execute"]
+        for tool_name in tool_names:
+            idx = text.find(f'"tool": "{tool_name}"')
+            if idx == -1:
+                idx = text.find(f'"tool":"{tool_name}"')
+            
+            if idx != -1:
+                # Find the opening brace before this
+                brace_start = text.rfind('{', 0, idx)
+                if brace_start != -1:
+                    # Find matching closing brace
+                    j = brace_start
+                    brace_count = 0
+                    in_string = False
+                    escape_next = False
+                    
+                    while j < len(text):
+                        char = text[j]
+                        
+                        if escape_next:
+                            escape_next = False
+                            j += 1
+                            continue
+                            
+                        if char == '\\':
+                            escape_next = True
+                        elif char == '"':
+                            in_string = not in_string
+                        elif not in_string:
+                            if char == '{':
+                                brace_count += 1
+                            elif char == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    json_str = text[brace_start:j+1]
+                                    try:
+                                        tool_call = json.loads(json_str)
+                                        if "tool" in tool_call and "args" in tool_call:
+                                            already_found = any(tc[1] == brace_start for tc in tool_calls)
+                                            if not already_found:
+                                                logger.info("Found tool call (strategy 2)", tool=tool_call.get("tool"))
+                                                tool_calls.append((tool_call, brace_start, j+1))
+                                    except json.JSONDecodeError:
+                                        pass
+                                    break
+                        j += 1
+    
+    logger.info("Tool extraction complete", found=len(tool_calls), text_preview=text[:200] if text else "")
     
     return tool_calls
 
@@ -115,32 +181,72 @@ async def chat_stream(
     """Server-Sent Events endpoint for streaming with tool execution."""
     mcp_tools = get_mcp_tools(request.workspace_path)
 
-    # Enhanced system prompt
-    system_prompt = """You are Prometheus, an autonomous AI coding agent. You MUST use tools to perform actions.
+    # Enhanced system prompt for autonomous coding
+    system_prompt = """You are Prometheus, an autonomous AI coding agent. You have tools to create, read, modify, and TEST files.
 
-AVAILABLE TOOLS:
-1. filesystem_write(path, content) - Create or modify files
-2. filesystem_read(path) - Read file contents
-3. shell_execute(command) - Run shell commands
+TOOLS AVAILABLE:
+1. filesystem_write(path, content) - Create/modify files
+2. filesystem_read(path) - Read file contents  
+3. filesystem_list(path) - List directory (use path="" for root)
+4. run_python(file_path, stdin_input, args) - Run Python file with optional test input
+5. run_tests(test_path) - Run pytest on test files
+6. shell_execute(command) - Run shell commands (non-interactive only)
+
+TOOL FORMAT - Use this exact JSON format:
+{"tool": "TOOL_NAME", "args": {"param": "value"}}
 
 CRITICAL RULES:
-- When user asks to create/modify code, you MUST use filesystem_write
-- When user asks to run something, you MUST use shell_execute
-- Format tool calls as: {"tool": "filesystem_write", "args": {"path": "file.py", "content": "code here"}}
-- Use ONE tool call per message
-- After tool call, explain what you did
+1. When asked to CREATE code - use filesystem_write IMMEDIATELY
+2. When asked to TEST/RUN Python - use run_python with stdin_input for interactive scripts
+3. When asked to READ/SHOW code - use filesystem_read
+4. Do NOT ask permission - just do it
+5. Write complete, working code - not pseudocode
+6. After the tool JSON, briefly explain what you created/did
+7. For interactive programs, provide test input via stdin_input parameter
 
-Example:
-User: "create a hello.py file"
-You: {"tool": "filesystem_write", "args": {"path": "hello.py", "content": "print('Hello, World!')"}}"""
+TESTING EXAMPLES:
 
-    messages_with_system = [{"role": "system", "content": system_prompt}]
+Example 1 - Run a non-interactive script:
+{"tool": "run_python", "args": {"file_path": "hello.py"}}
+
+Example 2 - Run interactive script with test input:
+{"tool": "run_python", "args": {"file_path": "calculator.py", "stdin_input": "5 + 3\\nquit\\n"}}
+
+Example 3 - Run with command line args:
+{"tool": "run_python", "args": {"file_path": "script.py", "args": "--input data.txt"}}
+
+Example 4 - Run pytest:
+{"tool": "run_tests", "args": {"test_path": "test_calculator.py"}}
+
+WHEN WRITING CODE FOR TESTING:
+- Add a simple test mode: if __name__ == '__main__' should demonstrate the code works
+- Include print statements showing results
+- For calculators/converters: print example calculations
+- Avoid infinite loops in test mode
+
+EXAMPLE - Create and test a calculator:
+
+{"tool": "filesystem_write", "args": {"path": "calc.py", "content": "#!/usr/bin/env python3\\n\\ndef add(a, b): return a + b\\ndef sub(a, b): return a - b\\ndef mul(a, b): return a * b\\ndef div(a, b): return a / b if b else 'Error'\\n\\nif __name__ == '__main__':\\n    print('Testing calculator...')\\n    print(f'5 + 3 = {add(5, 3)}')\\n    print(f'10 - 4 = {sub(10, 4)}')\\n    print(f'6 * 7 = {mul(6, 7)}')\\n    print(f'15 / 3 = {div(15, 3)}')\\n    print('All tests passed!')\\n"}}
+
+Then test it:
+{"tool": "run_python", "args": {"file_path": "calc.py"}}
+
+REMEMBER: Take action immediately. Create testable code with example output."""
+
+    # Inject user-defined rules
+    rules_text = await get_enabled_rules_text(request.workspace_path or "")
+    full_system_prompt = system_prompt + rules_text
+
+    messages_with_system = [{"role": "system", "content": full_system_prompt}]
     messages_with_system.extend([msg.model_dump() for msg in request.messages])
 
     async def event_generator():
         accumulated_response = ""
         tool_calls_executed: set[str] = set()
         last_sent_length = 0
+        
+        import structlog
+        logger = structlog.get_logger()
         
         try:
             async for chunk in model_router.stream(
@@ -156,6 +262,8 @@ You: {"tool": "filesystem_write", "args": {"path": "hello.py", "content": "print
                     # Check for complete tool calls
                     tool_calls = extract_tool_calls(accumulated_response)
                     
+                    logger.info("Tool calls detected", count=len(tool_calls), response_length=len(accumulated_response))
+                    
                     for tool_call, start, end in tool_calls:
                         # Skip if already executed
                         tool_signature = json.dumps(tool_call, sort_keys=True)
@@ -166,6 +274,8 @@ You: {"tool": "filesystem_write", "args": {"path": "hello.py", "content": "print
                         tool_name = tool_call.get("tool")
                         args = tool_call.get("args", {})
                         
+                        logger.info("Executing tool", tool=tool_name, args=args)
+                        
                         result = None
                         if tool_name == "filesystem_write":
                             result = mcp_tools.filesystem_write(
@@ -174,8 +284,20 @@ You: {"tool": "filesystem_write", "args": {"path": "hello.py", "content": "print
                             )
                         elif tool_name == "filesystem_read":
                             result = mcp_tools.filesystem_read(args.get("path", ""))
+                        elif tool_name == "filesystem_list":
+                            result = mcp_tools.filesystem_list(args.get("path", ""))
+                        elif tool_name == "run_python":
+                            result = mcp_tools.run_python(
+                                args.get("file_path", ""),
+                                args.get("stdin_input", ""),
+                                args.get("args", "")
+                            )
+                        elif tool_name == "run_tests":
+                            result = mcp_tools.run_tests(args.get("test_path", ""))
                         elif tool_name == "shell_execute":
                             result = mcp_tools.shell_execute(args.get("command", ""))
+                        
+                        logger.info("Tool execution result", result=result)
                         
                         if result:
                             # Send tool execution result
@@ -184,12 +306,15 @@ You: {"tool": "filesystem_write", "args": {"path": "hello.py", "content": "print
                                     "tool": tool_name,
                                     "success": result.get("success", False),
                                     "path": result.get("path"),
+                                    "file": result.get("file"),
                                     "command": result.get("command"),
                                     "action": result.get("action"),
                                     "stdout": result.get("stdout"),
                                     "stderr": result.get("stderr"),
                                     "content": result.get("content"),
-                                    "error": result.get("error")
+                                    "error": result.get("error"),
+                                    "return_code": result.get("return_code"),
+                                    "hint": result.get("hint")
                                 }
                             })
                             yield f"data: {tool_data}\n\n"
@@ -197,9 +322,12 @@ You: {"tool": "filesystem_write", "args": {"path": "hello.py", "content": "print
                     # Check if we're in the middle of a potential JSON object
                     # Count unmatched opening braces
                     open_braces = accumulated_response.count('{') - accumulated_response.count('}')
-                    in_potential_json = '{"tool"' in accumulated_response[last_sent_length:] or open_braces > 0
                     
-                    if not in_potential_json:
+                    # More aggressive streaming - only hold back if we're actively mid-JSON
+                    recent_chunk = accumulated_response[max(0, len(accumulated_response) - 50):]
+                    looks_like_json_start = '{"tool"' in recent_chunk and open_braces > 0
+                    
+                    if not looks_like_json_start:
                         # Safe to send - strip any tool calls and send new content
                         clean_response = strip_tool_calls(accumulated_response)
                         new_content = clean_response[last_sent_length:]
