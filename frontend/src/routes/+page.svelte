@@ -598,11 +598,159 @@
 			console.error('Error loading tools:', error);
 		}
 	}
-	
+
+	// Slash command handler
+	async function handleSlashCommand(command: string) {
+		const parts = command.split(' ');
+		const cmd = parts[0].toLowerCase();
+		const args = parts.slice(1);
+
+		switch (cmd) {
+			case '/clear':
+				// Clear chat messages
+				$messages = [];
+				$toolExecutions = [];
+				$activeToolCalls = [];
+				activeCodeAnimations.clear();
+				activeDiffAnimations.clear();
+				$contextInfo = null;
+				addLog('Chat cleared');
+				break;
+
+			case '/compact':
+			case '/compress':
+				// Trigger manual compression by sending a special request
+				if ($messages.length === 0) {
+					addLog('No messages to compress');
+					return;
+				}
+				addLog('Compressing conversation...');
+				// Add a system message that will trigger compression on next interaction
+				$messages = [...$messages, {
+					role: 'user',
+					content: '[Compress conversation and continue]',
+					timestamp: new Date()
+				}];
+				// Then immediately send to trigger compression
+				await sendMessageWithCompression();
+				break;
+
+			case '/reset':
+				// Reset entire conversation
+				if (confirm('Reset entire conversation? This will clear all messages and start fresh.')) {
+					$messages = [];
+					$toolExecutions = [];
+					$activeToolCalls = [];
+					activeCodeAnimations.clear();
+					activeDiffAnimations.clear();
+					$contextInfo = null;
+					$currentConversationId = null;
+					addLog('Conversation reset');
+				}
+				break;
+
+			case '/new':
+			case '/newconversation':
+				// Start new conversation
+				await createNewConversation();
+				addLog(`New conversation created: ${$currentConversationId}`);
+				break;
+
+			case '/help':
+				// Show available commands
+				const helpMessage = `**Available Commands:**
+
+**/clear** - Clear chat messages and context
+**/compact** or **/compress** - Compress conversation to save tokens
+**/reset** - Reset entire conversation and start fresh
+**/new** - Start a new conversation
+**/help** - Show this help message
+
+**Tips:**
+- Use Shift+Enter for new lines in messages
+- Enable Verbose Mode in Settings to see tool call details
+- Context auto-compresses when approaching token limits`;
+
+				$messages = [...$messages, {
+					role: 'assistant',
+					content: helpMessage,
+					timestamp: new Date()
+				}];
+				break;
+
+			default:
+				addLog(`Unknown command: ${cmd}. Type /help for available commands.`);
+		}
+	}
+
+	// Helper function for compression command
+	async function sendMessageWithCompression() {
+		if ($messages.length === 0) return;
+
+		$isLoading = true;
+		$abortController = new AbortController();
+
+		try {
+			const response = await streamChat({
+				model: $selectedModel,
+				messages: $messages.map(m => ({ role: m.role, content: m.content, timestamp: m.timestamp })),
+				workspace_path: $workspacePath,
+				api_base: $customEndpoint || undefined
+			}, $abortController.signal);
+
+			const reader = response.body?.getReader();
+			if (!reader) return;
+
+			const decoder = new TextDecoder();
+			let currentResponse = '';
+			$messages = [...$messages, { role: 'assistant', content: '', timestamp: new Date() }];
+
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+
+				const chunk = decoder.decode(value);
+				const lines = chunk.split('\n');
+
+				for (const line of lines) {
+					if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+						try {
+							const data = JSON.parse(line.slice(6));
+
+							if (data.token) {
+								currentResponse += data.token;
+								$messages[$messages.length - 1].content = currentResponse;
+								$messages = [...$messages];
+							}
+
+							if (data.context_info) {
+								$contextInfo = data.context_info;
+								if (data.context_info.compressed) {
+									addLog(`Compressed: saved ${data.context_info.tokens_saved?.toLocaleString()} tokens`);
+								}
+							}
+						} catch (e) {
+							console.error('Error parsing SSE data:', e);
+						}
+					}
+				}
+			}
+		} catch (error: any) {
+			if (error.name === 'AbortError') {
+				console.log('Request aborted');
+			} else {
+				console.error('Error:', error);
+				addLog(`Error: ${error.message}`);
+			}
+		} finally {
+			$isLoading = false;
+		}
+	}
+
 	// Chat (simplified - full implementation kept for now)
 	async function sendMessage() {
 		console.log('sendMessage called, chatInput:', $chatInput, 'workspacePath:', $workspacePath);
-		
+
 		if (!$chatInput.trim()) {
 			console.log('No chat input provided');
 			addLog('Please type a message first');
@@ -612,7 +760,14 @@
 			addLog('Error: Workspace path is required');
 			return;
 		}
-		
+
+		// Handle slash commands
+		if ($chatInput.trim().startsWith('/')) {
+			await handleSlashCommand($chatInput.trim());
+			$chatInput = '';
+			return;
+		}
+
 		const userMessage = $chatInput;
 		$messages = [...$messages, { role: 'user', content: userMessage, timestamp: new Date() }];
 		$chatInput = '';

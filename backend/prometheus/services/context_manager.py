@@ -346,6 +346,11 @@ async def check_and_compress_if_needed(
 
         context_info.update(compression_stats)
 
+        # Recalculate usage_ratio after compression with updated current_tokens
+        context_info["usage_ratio"] = round(
+            context_info["current_tokens"] / model_limit, 3
+        ) if model_limit > 0 else 0
+
         return compressed_messages, context_info
 
     return messages, context_info
