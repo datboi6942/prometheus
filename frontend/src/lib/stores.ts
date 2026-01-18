@@ -97,6 +97,11 @@ export const toolExecutions = writable<Array<{
 	timestamp: Date;
 	return_code?: number;
 	hint?: string;
+	diff?: {
+		format: string;
+		stats: { lines_added: number; lines_removed: number; lines_changed: number };
+		hunks: Array<{ header: string; changes: Array<{ type: string; line: string }> }>;
+	};
 }>>([]);
 
 // Active Tool Calls (in progress, not yet executed)
