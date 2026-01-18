@@ -11,17 +11,21 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# Database path - will be created in the workspace
-DB_PATH = Path("/tmp/prometheus_data/prometheus.db")
+from prometheus.config import settings
+
+# Database path - configurable via environment variable
+DB_PATH = Path(settings.database_path) / "prometheus.db"
 
 # Sensitive setting keys that should be encrypted
 SENSITIVE_KEYS = {
     "api_key",
+    "apiKey",
     "ollama_api_key",
     "openai_api_key",
     "anthropic_api_key",
     "google_api_key",
     "litellm_api_key",
+    "customApiKey",
 }
 
 
@@ -29,12 +33,18 @@ def _get_encryption_key() -> bytes:
     """Get or generate encryption key for sensitive settings.
 
     Uses environment variable ENCRYPTION_KEY if set, otherwise generates
-    a key derived from a default salt. In production, set ENCRYPTION_KEY
-    as a secure environment variable.
+    a key derived from a default salt.
+    
+    **IMPORTANT**: In production, you MUST set ENCRYPTION_KEY or ENCRYPTION_SALT
+    environment variables. The default salt is publicly visible and makes
+    rainbow table attacks easier. Never use default values in production.
 
     Returns:
         bytes: Fernet encryption key.
     """
+    import structlog
+
+    logger = structlog.get_logger()
     env_key = os.getenv("ENCRYPTION_KEY")
     if env_key:
         # If provided as base64, decode it
@@ -45,7 +55,13 @@ def _get_encryption_key() -> bytes:
             pass
 
     # Derive key from environment or default salt
+    # WARNING: Default salt is for development only
     salt = os.getenv("ENCRYPTION_SALT", "prometheus_default_salt_2024").encode()
+    if not os.getenv("ENCRYPTION_SALT"):
+        logger.warning(
+            "ENCRYPTION_SALT not set - using default salt. "
+            "This is insecure for production! Set ENCRYPTION_KEY or ENCRYPTION_SALT."
+        )
     password = (env_key or "prometheus_default_password").encode()
 
     kdf = PBKDF2HMAC(
@@ -85,10 +101,19 @@ def _decrypt_value(encrypted_value: str) -> str:
     Raises:
         ValueError: If decryption fails (value may not be encrypted).
     """
+    import structlog
+
+    logger = structlog.get_logger()
     try:
         return _fernet.decrypt(encrypted_value.encode()).decode()
-    except Exception:
-        # If decryption fails, assume value is not encrypted (backward compatibility)
+    except Exception as e:
+        # If decryption fails, log warning but return value for backward compatibility
+        # This handles cases where values were stored before encryption was added
+        logger.warning(
+            "Decryption failed - value may not be encrypted or key changed",
+            error=str(e),
+            value_preview=encrypted_value[:20] + "..." if len(encrypted_value) > 20 else encrypted_value,
+        )
         return encrypted_value
 
 
@@ -166,6 +191,42 @@ async def init_db() -> None:
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
+        """)
+
+        # Memories table (memory bank for persistent knowledge)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                tags TEXT,
+                workspace_path TEXT,
+                source TEXT NOT NULL,
+                conversation_id TEXT,
+                created_at TEXT NOT NULL,
+                last_accessed_at TEXT,
+                access_count INTEGER DEFAULT 0,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+            )
+        """)
+
+        # MCP Servers table (for dynamic tool registration)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS mcp_servers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                config TEXT NOT NULL,
+                enabled INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        # Create index for faster memory searches
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_workspace ON memories(workspace_path)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories(tags)
         """)
 
         await db.commit()
@@ -576,3 +637,288 @@ async def get_enabled_rules_text(workspace_path: str) -> str:
     if rules_text:
         return "\n\nUSER-DEFINED RULES (Follow these strictly):\n" + "\n\n".join(rules_text)
     return ""
+
+
+# Memory functions
+async def add_memory(
+    content: str,
+    source: str,
+    workspace_path: str | None = None,
+    conversation_id: str | None = None,
+    tags: str | None = None,
+) -> dict[str, Any]:
+    """Add a memory to the memory bank.
+
+    Args:
+        content: Memory content.
+        source: Source of memory ('user' or 'model').
+        workspace_path: Optional workspace path for workspace-specific memories.
+        conversation_id: Optional conversation ID where memory was created.
+        tags: Optional comma-separated tags for searching.
+
+    Returns:
+        dict: The created memory.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO memories (content, tags, workspace_path, source, conversation_id, created_at, last_accessed_at, access_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (content, tags, workspace_path, source, conversation_id, now, now),
+        )
+        memory_id = cursor.lastrowid
+        await db.commit()
+
+    return {
+        "id": memory_id,
+        "content": content,
+        "tags": tags,
+        "workspace_path": workspace_path,
+        "source": source,
+        "conversation_id": conversation_id,
+        "created_at": now,
+        "last_accessed_at": now,
+        "access_count": 0,
+    }
+
+
+async def get_memories(
+    workspace_path: str | None = None,
+    limit: int = 50,
+    search_query: str | None = None,
+) -> list[dict[str, Any]]:
+    """Get memories, optionally filtered by workspace and search query.
+
+    Args:
+        workspace_path: Optional workspace path to filter by.
+        limit: Maximum number of memories to return.
+        search_query: Optional search query to filter memories.
+
+    Returns:
+        list: List of memory dictionaries, sorted by relevance (access_count, last_accessed_at).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = "SELECT * FROM memories WHERE 1=1"
+        params: list[Any] = []
+
+        if workspace_path:
+            query += " AND (workspace_path = ? OR workspace_path IS NULL)"
+            params.append(workspace_path)
+
+        if search_query:
+            query += " AND (content LIKE ? OR tags LIKE ?)"
+            search_term = f"%{search_query}%"
+            params.extend([search_term, search_term])
+
+        query += " ORDER BY access_count DESC, last_accessed_at DESC, created_at DESC LIMIT ?"
+        params.append(limit)
+
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def get_relevant_memories(
+    workspace_path: str | None = None,
+    context: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Get relevant memories based on context and workspace.
+
+    Args:
+        workspace_path: Optional workspace path.
+        context: Optional context string to find relevant memories.
+        limit: Maximum number of memories to return.
+
+    Returns:
+        list: List of relevant memory dictionaries.
+    """
+    # Simple keyword-based relevance for now
+    # Could be enhanced with embeddings/semantic search
+    if context:
+        return await get_memories(workspace_path=workspace_path, search_query=context, limit=limit)
+    return await get_memories(workspace_path=workspace_path, limit=limit)
+
+
+async def update_memory_access(memory_id: int) -> None:
+    """Update memory access statistics.
+
+    Args:
+        memory_id: Memory ID to update.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE memories 
+            SET last_accessed_at = ?, access_count = access_count + 1
+            WHERE id = ?
+            """,
+            (now, memory_id),
+        )
+        await db.commit()
+
+
+async def delete_memory(memory_id: int) -> bool:
+    """Delete a memory.
+
+    Args:
+        memory_id: Memory ID to delete.
+
+    Returns:
+        bool: True if deleted.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        await db.commit()
+    return True
+
+
+async def get_memories_text(workspace_path: str | None = None, context: str | None = None) -> str:
+    """Get formatted memories text for injection into system prompt.
+
+    Args:
+        workspace_path: Optional workspace path.
+        context: Optional context for finding relevant memories.
+
+    Returns:
+        str: Formatted memories text.
+    """
+    memories = await get_relevant_memories(workspace_path=workspace_path, context=context, limit=10)
+    if not memories:
+        return ""
+
+    # Update access counts for retrieved memories
+    for memory in memories:
+        await update_memory_access(memory["id"])
+
+    memory_texts = []
+    for memory in memories:
+        source_label = "User" if memory["source"] == "user" else "Model"
+        memory_texts.append(f"[Memory - {source_label}]: {memory['content']}")
+
+    return "\n\nMEMORY BANK (Important information to remember):\n" + "\n".join(memory_texts)
+
+
+# MCP Server functions
+async def add_mcp_server(name: str, config: dict[str, Any]) -> dict[str, Any]:
+    """Add an MCP server configuration.
+
+    Args:
+        name: Server name.
+        config: Server configuration (JSON-serializable dict).
+
+    Returns:
+        dict: The created server configuration.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    config_json = json.dumps(config)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO mcp_servers (name, config, enabled, created_at, updated_at)
+            VALUES (?, ?, 1, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET config = ?, enabled = 1, updated_at = ?
+            """,
+            (name, config_json, now, now, config_json, now),
+        )
+        server_id = cursor.lastrowid
+        await db.commit()
+
+    return {
+        "id": server_id,
+        "name": name,
+        "config": config,
+        "enabled": 1,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+async def get_mcp_servers() -> list[dict[str, Any]]:
+    """Get all MCP server configurations.
+
+    Returns:
+        list: List of server configurations.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM mcp_servers ORDER BY created_at") as cursor:
+            rows = await cursor.fetchall()
+            result = []
+            for row in rows:
+                server = dict(row)
+                # Parse JSON config
+                try:
+                    server["config"] = json.loads(server["config"])
+                except Exception:
+                    server["config"] = {}
+                result.append(server)
+            return result
+
+
+async def get_mcp_server(name: str) -> dict[str, Any] | None:
+    """Get an MCP server configuration by name.
+
+    Args:
+        name: Server name.
+
+    Returns:
+        dict or None: Server configuration if found.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM mcp_servers WHERE name = ?", (name,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                server = dict(row)
+                try:
+                    server["config"] = json.loads(server["config"])
+                except Exception:
+                    server["config"] = {}
+                return server
+            return None
+
+
+async def update_mcp_server(name: str, config: dict[str, Any], enabled: bool = True) -> bool:
+    """Update an MCP server configuration.
+
+    Args:
+        name: Server name.
+        config: Updated configuration.
+        enabled: Whether server is enabled.
+
+    Returns:
+        bool: True if updated.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    config_json = json.dumps(config)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE mcp_servers 
+            SET config = ?, enabled = ?, updated_at = ?
+            WHERE name = ?
+            """,
+            (config_json, 1 if enabled else 0, now, name),
+        )
+        await db.commit()
+    return True
+
+
+async def delete_mcp_server(name: str) -> bool:
+    """Delete an MCP server.
+
+    Args:
+        name: Server name.
+
+    Returns:
+        bool: True if deleted.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM mcp_servers WHERE name = ?", (name,))
+        await db.commit()
+    return True

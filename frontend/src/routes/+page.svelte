@@ -10,7 +10,7 @@
 	
 	// VS Code style explorer
 	let explorerWidth = 280;
-	let activeExplorerTab: 'files' | 'search' | 'git' = 'files';
+	let activeExplorerTab: 'files' | 'search' | 'history' | 'git' = 'files';
 	let showExplorer = true;
 	let isCreatingFile = false;
 	let isCreatingFolder = false;
@@ -39,7 +39,55 @@
 	let isGlobalRule = true;
 	let settingsLoaded = false; // Prevent saving during initial load
 	let showSettings = false;
+	
+	// Memory bank
+	let memories: Array<{id: number, content: string, source: string, tags: string | null, created_at: string, access_count: number}> = [];
+	let showMemoriesPanel = false;
+	let memorySearchQuery = '';
 	let activeView = 'chat'; // 'chat', 'forge'
+	
+	// File search
+	let fileSearchQuery = '';
+	let fileSearchResults: Array<{path: string, name: string, match_type: string, matches?: Array<{line: number, content: string}>}> = [];
+	let isSearchingFiles = false;
+	let searchInContent = false;
+	
+	// MCP Servers
+	let mcpServers: Array<{id: number, name: string, config: any, enabled: number}> = [];
+	let showMCPServersPanel = false;
+	let newMCPServerName = '';
+	let newMCPServerCommand = '';
+	let newMCPServerArgs: string[] = [];
+	let newMCPServerArgInput = '';
+	let newMCPServerEnvVars: Array<{key: string, value: string}> = [];
+	let newMCPServerEnvKey = '';
+	let newMCPServerEnvValue = '';
+	let newMCPServerCwd = '';
+	let newMCPServerTransport = 'stdio'; // stdio, http, sse
+	let newMCPServerHttpUrl = '';
+	let newMCPServerTools: Array<{name: string, description: string, parameters: any}> = [];
+	let newMCPServerToolName = '';
+	let newMCPServerToolDesc = '';
+	let newMCPServerToolParams = '';
+	let availableTools: Array<{name: string, description: string, source: string}> = [];
+	
+	// Git state
+	let gitStatus: any = null;
+	let gitBranches: Array<{name: string, is_current: boolean, is_remote: boolean}> = [];
+	let gitCommits: Array<{hash: string, message: string, author: string, date: string}> = [];
+	let selectedFiles: Set<string> = new Set();
+	let commitMessage = '';
+	let isGitRepo = false;
+	let githubAuthenticated = false;
+	let githubToken = '';
+	let githubUser: any = null;
+	let showGitHubAuth = false;
+	let showCreateRepo = false;
+	let newRepoName = '';
+	let newRepoDescription = '';
+	let newRepoPrivate = false;
+	let gitDiff: string = '';
+	let selectedDiffFile: string | null = null;
 	let showTerminalPanel = false; // Bottom terminal panel
 	let isConnected = false;
 	let isLoading = false;
@@ -487,12 +535,18 @@
 	}
 
 	// Conversation management
-	async function loadConversations() {
+	async function loadConversations(autoSelect: boolean = false) {
 		try {
 			const response = await fetch('http://localhost:8000/api/v1/conversations');
 			if (response.ok) {
 				const data = await response.json();
 				conversations = data.conversations || [];
+				
+				// Auto-select most recent conversation if none is selected and conversations exist
+				if (autoSelect && conversations.length > 0 && !currentConversationId) {
+					const mostRecent = conversations[0]; // Already sorted by updated_at DESC
+					await loadConversation(mostRecent.id);
+				}
 			}
 		} catch (error) {
 			console.error('Error loading conversations:', error);
@@ -623,6 +677,482 @@
 		}
 	}
 
+	// Memory bank management
+	async function loadMemories() {
+		try {
+			const params = new URLSearchParams();
+			if (workspacePath) params.append('workspace_path', workspacePath);
+			if (memorySearchQuery) params.append('search', memorySearchQuery);
+			params.append('limit', '100');
+			
+			const response = await fetch(`http://localhost:8000/api/v1/memories?${params.toString()}`);
+			if (response.ok) {
+				const data = await response.json();
+				memories = data.memories || [];
+			}
+		} catch (error) {
+			console.error('Error loading memories:', error);
+		}
+	}
+
+	async function deleteMemory(memoryId: number) {
+		if (!confirm('Delete this memory?')) return;
+		try {
+			await fetch(`http://localhost:8000/api/v1/memories/${memoryId}`, { method: 'DELETE' });
+			await loadMemories();
+		} catch (error) {
+			console.error('Error deleting memory:', error);
+		}
+	}
+
+	// MCP Server management
+	async function loadMCPServers() {
+		try {
+			const response = await fetch('http://localhost:8000/api/v1/mcp/servers');
+			if (response.ok) {
+				const data = await response.json();
+				mcpServers = data.servers || [];
+			}
+		} catch (error) {
+			console.error('Error loading MCP servers:', error);
+		}
+	}
+
+	async function loadAvailableTools() {
+		try {
+			const response = await fetch('http://localhost:8000/api/v1/mcp/tools');
+			if (response.ok) {
+				const data = await response.json();
+				availableTools = data.tools || [];
+			}
+		} catch (error) {
+			console.error('Error loading tools:', error);
+		}
+	}
+
+	async function searchFiles() {
+		if (!fileSearchQuery.trim()) return;
+		
+		isSearchingFiles = true;
+		fileSearchResults = [];
+		
+		try {
+			const params = new URLSearchParams({
+				query: fileSearchQuery,
+				search_content: searchInContent.toString()
+			});
+			
+			const response = await fetch(`http://localhost:8000/api/v1/files/search?${params}`);
+			if (response.ok) {
+				const data = await response.json();
+				fileSearchResults = data.results || [];
+			} else {
+				console.error('Search failed:', await response.text());
+			}
+		} catch (error) {
+			console.error('Error searching files:', error);
+		} finally {
+			isSearchingFiles = false;
+		}
+	}
+
+	async function openFileFromPath(path: string) {
+		// Find the file in the file tree and open it
+		const fileItem = findFileInTree(files, path);
+		if (fileItem) {
+			await openFileInEditor(fileItem);
+		} else {
+			// If file not in tree, create a file item and open it
+			const pathParts = path.split('/');
+			const fileName = pathParts[pathParts.length - 1];
+			const fileItem: FileItem = {
+				name: fileName,
+				path: path,
+				type: 'file',
+				level: pathParts.length - 1
+			};
+			await openFileInEditor(fileItem);
+		}
+	}
+
+	function findFileInTree(fileTree: FileItem[], targetPath: string): FileItem | null {
+		for (const item of flattenTree(fileTree)) {
+			if (item.path === targetPath) {
+				return item;
+			}
+		}
+		return null;
+	}
+
+	function addMCPServerArg() {
+		if (newMCPServerArgInput.trim()) {
+			newMCPServerArgs = [...newMCPServerArgs, newMCPServerArgInput.trim()];
+			newMCPServerArgInput = '';
+		}
+	}
+
+	function removeMCPServerArg(index: number) {
+		newMCPServerArgs = newMCPServerArgs.filter((_, i) => i !== index);
+	}
+
+	function addMCPServerEnvVar() {
+		if (newMCPServerEnvKey.trim() && newMCPServerEnvValue.trim()) {
+			newMCPServerEnvVars = [...newMCPServerEnvVars, { key: newMCPServerEnvKey.trim(), value: newMCPServerEnvValue.trim() }];
+			newMCPServerEnvKey = '';
+			newMCPServerEnvValue = '';
+		}
+	}
+
+	function removeMCPServerEnvVar(index: number) {
+		newMCPServerEnvVars = newMCPServerEnvVars.filter((_, i) => i !== index);
+	}
+
+	function addMCPServerTool() {
+		if (newMCPServerToolName.trim()) {
+			let params = {};
+			if (newMCPServerToolParams.trim()) {
+				try {
+					params = JSON.parse(newMCPServerToolParams);
+				} catch {
+					alert('Invalid JSON for tool parameters');
+					return;
+				}
+			}
+			newMCPServerTools = [...newMCPServerTools, {
+				name: newMCPServerToolName.trim(),
+				description: newMCPServerToolDesc.trim(),
+				parameters: params
+			}];
+			newMCPServerToolName = '';
+			newMCPServerToolDesc = '';
+			newMCPServerToolParams = '';
+		}
+	}
+
+	function removeMCPServerTool(index: number) {
+		newMCPServerTools = newMCPServerTools.filter((_, i) => i !== index);
+	}
+
+	function resetMCPServerForm() {
+		newMCPServerName = '';
+		newMCPServerCommand = '';
+		newMCPServerArgs = [];
+		newMCPServerArgInput = '';
+		newMCPServerEnvVars = [];
+		newMCPServerEnvKey = '';
+		newMCPServerEnvValue = '';
+		newMCPServerCwd = '';
+		newMCPServerTransport = 'stdio';
+		newMCPServerHttpUrl = '';
+		newMCPServerTools = [];
+		newMCPServerToolName = '';
+		newMCPServerToolDesc = '';
+		newMCPServerToolParams = '';
+	}
+
+	async function createMCPServer() {
+		if (!newMCPServerName.trim()) {
+			alert('Server name is required');
+			return;
+		}
+		
+		if (newMCPServerTransport === 'stdio' && !newMCPServerCommand.trim()) {
+			alert('Command is required for stdio transport');
+			return;
+		}
+		
+		if (newMCPServerTransport === 'http' && !newMCPServerHttpUrl.trim()) {
+			alert('HTTP URL is required for HTTP transport');
+			return;
+		}
+
+		try {
+			// Build config object
+			const config: any = {};
+			
+			if (newMCPServerTransport === 'stdio') {
+				// Build command array
+				const command = newMCPServerCommand.trim();
+				if (newMCPServerArgs.length > 0) {
+					config.command = [command, ...newMCPServerArgs];
+				} else {
+					config.command = command;
+				}
+			} else if (newMCPServerTransport === 'http') {
+				config.url = newMCPServerHttpUrl.trim();
+			}
+			
+			// Add environment variables
+			if (newMCPServerEnvVars.length > 0) {
+				config.env = {};
+				newMCPServerEnvVars.forEach(env => {
+					config.env[env.key] = env.value;
+				});
+			}
+			
+			// Add working directory
+			if (newMCPServerCwd.trim()) {
+				config.cwd = newMCPServerCwd.trim();
+			}
+			
+			// Add transport type
+			config.transport = newMCPServerTransport;
+			
+			// Add tools (if manually configured)
+			if (newMCPServerTools.length > 0) {
+				config.tools = newMCPServerTools;
+			}
+			
+			const response = await fetch('http://localhost:8000/api/v1/mcp/servers', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					name: newMCPServerName,
+					config: config,
+					enabled: true
+				})
+			});
+			
+			if (response.ok) {
+				resetMCPServerForm();
+				await loadMCPServers();
+				await loadAvailableTools();
+			} else {
+				const error = await response.json();
+				alert(`Error: ${error.detail || 'Failed to create MCP server'}`);
+			}
+		} catch (error) {
+			console.error('Error creating MCP server:', error);
+			alert('Error creating MCP server');
+		}
+	}
+
+	async function deleteMCPServer(name: string) {
+		if (!confirm(`Delete MCP server "${name}"?`)) return;
+		try {
+			await fetch(`http://localhost:8000/api/v1/mcp/servers/${name}`, { method: 'DELETE' });
+			await loadMCPServers();
+			await loadAvailableTools();
+		} catch (error) {
+			console.error('Error deleting MCP server:', error);
+		}
+	}
+
+	async function reloadMCPServer(name: string) {
+		try {
+			await fetch(`http://localhost:8000/api/v1/mcp/servers/${name}/reload`, { method: 'POST' });
+			await loadAvailableTools();
+		} catch (error) {
+			console.error('Error reloading MCP server:', error);
+		}
+	}
+
+	// Git operations
+	async function loadGitStatus() {
+		try {
+			const response = await fetch(`http://localhost:8000/api/v1/git/status?workspace_path=${encodeURIComponent(workspacePath)}`);
+			if (response.ok) {
+				const data = await response.json();
+				gitStatus = data;
+				isGitRepo = !data.error;
+				if (data.error && data.error.includes('Not a git repository')) {
+					isGitRepo = false;
+				}
+			} else {
+				isGitRepo = false;
+			}
+		} catch (error) {
+			console.error('Error loading git status:', error);
+			isGitRepo = false;
+		}
+	}
+
+	async function initGitRepo() {
+		try {
+			const response = await fetch(`http://localhost:8000/api/v1/git/init?workspace_path=${encodeURIComponent(workspacePath)}`, {
+				method: 'POST'
+			});
+			if (response.ok) {
+				await loadGitStatus();
+			}
+		} catch (error) {
+			console.error('Error initializing repo:', error);
+		}
+	}
+
+	async function stageFiles(files: string[]) {
+		try {
+			const response = await fetch(`http://localhost:8000/api/v1/git/stage?workspace_path=${encodeURIComponent(workspacePath)}`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ files })
+			});
+			if (response.ok) {
+				await loadGitStatus();
+				selectedFiles.clear();
+			}
+		} catch (error) {
+			console.error('Error staging files:', error);
+		}
+	}
+
+	async function unstageFiles(files: string[]) {
+		try {
+			const response = await fetch(`http://localhost:8000/api/v1/git/unstage?workspace_path=${encodeURIComponent(workspacePath)}`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ files })
+			});
+			if (response.ok) {
+				await loadGitStatus();
+				selectedFiles.clear();
+			}
+		} catch (error) {
+			console.error('Error unstaging files:', error);
+		}
+	}
+
+	async function createCommit() {
+		if (!commitMessage.trim()) return;
+		try {
+			const response = await fetch(`http://localhost:8000/api/v1/git/commit?workspace_path=${encodeURIComponent(workspacePath)}`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ message: commitMessage })
+			});
+			if (response.ok) {
+				commitMessage = '';
+				await loadGitStatus();
+				await loadGitBranches();
+				await loadGitLog();
+			}
+		} catch (error) {
+			console.error('Error creating commit:', error);
+		}
+	}
+
+	async function loadGitBranches() {
+		try {
+			const response = await fetch(`http://localhost:8000/api/v1/git/branches?workspace_path=${encodeURIComponent(workspacePath)}`);
+			if (response.ok) {
+				const data = await response.json();
+				gitBranches = data.branches || [];
+			}
+		} catch (error) {
+			console.error('Error loading branches:', error);
+		}
+	}
+
+	async function loadGitLog() {
+		try {
+			const response = await fetch(`http://localhost:8000/api/v1/git/log?workspace_path=${encodeURIComponent(workspacePath)}&limit=20`);
+			if (response.ok) {
+				const data = await response.json();
+				gitCommits = data.commits || [];
+			}
+		} catch (error) {
+			console.error('Error loading git log:', error);
+		}
+	}
+
+	async function pushToRemote() {
+		try {
+			const response = await fetch(`http://localhost:8000/api/v1/git/push?workspace_path=${encodeURIComponent(workspacePath)}`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ remote: 'origin', set_upstream: true })
+			});
+			if (response.ok) {
+				await loadGitStatus();
+			} else {
+				const data = await response.json();
+				alert(`Push failed: ${data.detail || 'Unknown error'}`);
+			}
+		} catch (error) {
+			console.error('Error pushing:', error);
+			alert(`Push failed: ${error}`);
+		}
+	}
+
+	async function pullFromRemote() {
+		try {
+			const response = await fetch(`http://localhost:8000/api/v1/git/pull?workspace_path=${encodeURIComponent(workspacePath)}`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ remote: 'origin' })
+			});
+			if (response.ok) {
+				await loadGitStatus();
+				await refreshFileTree();
+			} else {
+				const data = await response.json();
+				alert(`Pull failed: ${data.detail || 'Unknown error'}`);
+			}
+		} catch (error) {
+			console.error('Error pulling:', error);
+			alert(`Pull failed: ${error}`);
+		}
+	}
+
+	async function checkGitHubAuth() {
+		try {
+			const response = await fetch('http://localhost:8000/api/v1/git/github/auth');
+			if (response.ok) {
+				const data = await response.json();
+				githubAuthenticated = data.authenticated;
+				githubUser = data.user;
+			}
+		} catch (error) {
+			console.error('Error checking GitHub auth:', error);
+		}
+	}
+
+	async function saveGitHubToken() {
+		if (!githubToken.trim()) return;
+		try {
+			await fetch('http://localhost:8000/api/v1/settings', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ key: 'github_token', value: githubToken })
+			});
+			githubToken = '';
+			showGitHubAuth = false;
+			await checkGitHubAuth();
+		} catch (error) {
+			console.error('Error saving GitHub token:', error);
+		}
+	}
+
+	async function createGitHubRepo() {
+		if (!newRepoName.trim()) return;
+		try {
+			const response = await fetch('http://localhost:8000/api/v1/git/github/repos', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					name: newRepoName,
+					description: newRepoDescription,
+					private: newRepoPrivate
+				})
+			});
+			if (response.ok) {
+				const data = await response.json();
+				// Add as remote and push
+				await fetch(`http://localhost:8000/api/v1/git/remote?workspace_path=${encodeURIComponent(workspacePath)}`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ name: 'origin', url: data.clone_url })
+				});
+				newRepoName = '';
+				newRepoDescription = '';
+				showCreateRepo = false;
+				await loadGitStatus();
+			}
+		} catch (error) {
+			console.error('Error creating GitHub repo:', error);
+		}
+	}
+
 	// Settings persistence
 	async function loadSettings() {
 		try {
@@ -659,12 +1189,35 @@
 	}
 
 	// Watch for settings changes and auto-save (debounced via settingsLoaded check)
-	$: if (settingsLoaded && customApiKey) saveSetting('apiKey', customApiKey);
-	$: if (settingsLoaded && customEndpoint) saveSetting('customEndpoint', customEndpoint);
-	$: if (settingsLoaded) saveSetting('workspacePath', workspacePath);
-	$: if (settingsLoaded) saveSetting('selectedModel', selectedModel);
-	$: if (settingsLoaded) saveSetting('autoApproveEdits', String(autoApproveEdits));
-	$: if (settingsLoaded) saveSetting('verboseMode', String(verboseMode));
+	// Use a small delay to avoid saving during initial load and prevent race conditions
+	let saveTimeout: ReturnType<typeof setTimeout> | null = null;
+	
+	function debouncedSave(key: string, value: string) {
+		if (saveTimeout) clearTimeout(saveTimeout);
+		saveTimeout = setTimeout(() => {
+			saveSetting(key, value);
+			saveTimeout = null;
+		}, 1000); // 1 second debounce
+	}
+	
+	$: if (settingsLoaded && customApiKey !== undefined && customApiKey !== '') {
+		debouncedSave('apiKey', customApiKey);
+	}
+	$: if (settingsLoaded && customEndpoint !== undefined && customEndpoint !== '') {
+		debouncedSave('customEndpoint', customEndpoint);
+	}
+	$: if (settingsLoaded && workspacePath) {
+		debouncedSave('workspacePath', workspacePath);
+	}
+	$: if (settingsLoaded && selectedModel) {
+		debouncedSave('selectedModel', selectedModel);
+	}
+	$: if (settingsLoaded) {
+		debouncedSave('autoApproveEdits', String(autoApproveEdits));
+	}
+	$: if (settingsLoaded) {
+		debouncedSave('verboseMode', String(verboseMode));
+	}
 
 	
 	function addLog(text: string, type = 'info') {
@@ -678,6 +1231,11 @@
 		messages = [...messages, { role: 'user', content: userMessage, timestamp: new Date() }];
 		chatInput = '';
 		isLoading = true;
+		
+		// Create conversation if none exists
+		if (!currentConversationId) {
+			await createNewConversation();
+		}
 		
 		// Save user message to conversation
 		if (currentConversationId) {
@@ -701,7 +1259,8 @@
 					messages: messages.map(m => ({ role: m.role, content: m.content })),
 					api_base: customEndpoint || null,
 					api_key: customApiKey || null,
-					workspace_path: workspacePath
+					workspace_path: workspacePath,
+					conversation_id: currentConversationId || null
 				})
 			});
 
@@ -927,9 +1486,18 @@ if __name__ == "__main__":
 		// Load file tree
 		await refreshFileTree();
 		
-		// Load conversations and rules
-		await loadConversations();
+		// Load conversations, rules, and memories
+		await loadConversations(true); // Auto-select most recent conversation
 		await loadRules();
+		await loadMemories();
+		
+		// Load Git status and GitHub auth
+		await loadGitStatus();
+		await checkGitHubAuth();
+		
+		// Load MCP servers and tools
+		await loadMCPServers();
+		await loadAvailableTools();
 	});
 </script>
 
@@ -960,7 +1528,14 @@ if __name__ == "__main__":
 		</button>
 		
 		<button 
-			on:click={() => { showExplorer = true; activeExplorerTab = 'git'; }}
+			on:click={() => { showExplorer = true; activeExplorerTab = 'history'; loadConversations(); }}
+			class="activity-btn {showExplorer && activeExplorerTab === 'history' ? 'active' : ''}"
+			title="Chat History">
+			<History class="w-5 h-5" />
+		</button>
+		
+		<button 
+			on:click={() => { showExplorer = true; activeExplorerTab = 'git'; loadGitStatus(); loadGitBranches(); loadGitLog(); }}
 			class="activity-btn {showExplorer && activeExplorerTab === 'git' ? 'active' : ''}"
 			title="Source Control">
 			<GitBranch class="w-5 h-5" />
@@ -990,7 +1565,21 @@ if __name__ == "__main__":
 			title="Rules">
 			<BookOpen class="w-5 h-5" />
 		</button>
-
+		
+		<button 
+			on:click={() => { showMemoriesPanel = !showMemoriesPanel; loadMemories(); }}
+			class="activity-btn {showMemoriesPanel ? 'active' : ''}"
+			title="Memory Bank">
+			<MessageSquare class="w-5 h-5" />
+		</button>
+		
+		<button 
+			on:click={() => { showMCPServersPanel = !showMCPServersPanel; loadMCPServers(); loadAvailableTools(); }}
+			class="activity-btn {showMCPServersPanel ? 'active' : ''}"
+			title="MCP Servers">
+			<Code2 class="w-5 h-5" />
+		</button>
+		
 		<button 
 			on:click={() => showSettings = !showSettings}
 			class="activity-btn {showSettings ? 'active' : ''}"
@@ -1005,7 +1594,7 @@ if __name__ == "__main__":
 		<!-- Panel Header -->
 		<div class="h-9 flex items-center justify-between px-4 bg-slate-900/50 border-b border-slate-800/50">
 			<span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-				{activeExplorerTab === 'files' ? 'Explorer' : activeExplorerTab === 'search' ? 'Search' : 'Source Control'}
+				{activeExplorerTab === 'files' ? 'Explorer' : activeExplorerTab === 'search' ? 'Search' : activeExplorerTab === 'history' ? 'Chat History' : 'Source Control'}
 			</span>
 			<button on:click={() => showExplorer = false} class="p-1 hover:bg-slate-700/50 rounded">
 				<X class="w-4 h-4 text-slate-500" />
@@ -1112,17 +1701,88 @@ if __name__ == "__main__":
 			</div>
 		{:else if activeExplorerTab === 'search'}
 			<!-- Search Panel -->
-			<div class="flex-1 flex flex-col p-3">
-				<input 
-					type="text" 
-					placeholder="Search files..."
-					class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
-				/>
-				<div class="text-xs text-slate-500 mt-4 text-center">
-					Search functionality coming soon
+			<div class="flex-1 flex flex-col overflow-hidden">
+				<div class="p-3 border-b border-slate-800/30">
+					<div class="flex gap-2 mb-2">
+						<input 
+							type="text" 
+							bind:value={fileSearchQuery}
+							on:keydown={(e) => e.key === 'Enter' && searchFiles()}
+							placeholder="Search files..."
+							class="flex-1 bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+						/>
+						<button 
+							on:click={searchFiles}
+							disabled={!fileSearchQuery.trim() || isSearchingFiles}
+							class="px-3 py-2 bg-amber-500 hover:bg-amber-600 disabled:bg-slate-700 disabled:cursor-not-allowed text-white text-xs font-bold rounded transition-all flex items-center justify-center"
+						>
+							{#if isSearchingFiles}
+								<Loader2 class="w-4 h-4 animate-spin" />
+							{:else}
+								<Search class="w-4 h-4" />
+							{/if}
+						</button>
+					</div>
+					<label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer">
+						<input 
+							type="checkbox" 
+							bind:checked={searchInContent}
+							class="accent-amber-500"
+						/>
+						<span>Search in file contents</span>
+					</label>
+				</div>
+				<div class="flex-1 overflow-y-auto p-3">
+					{#if isSearchingFiles}
+						<div class="flex items-center justify-center py-8">
+							<Loader2 class="w-5 h-5 text-slate-500 animate-spin" />
+						</div>
+					{:else if fileSearchQuery && fileSearchResults.length === 0}
+						<div class="text-xs text-slate-500 text-center py-8">
+							No results found for "{fileSearchQuery}"
+						</div>
+					{:else if fileSearchResults.length > 0}
+						<div class="text-xs text-slate-400 mb-2">
+							Found {fileSearchResults.length} result{fileSearchResults.length !== 1 ? 's' : ''}
+						</div>
+						<div class="space-y-1">
+							{#each fileSearchResults as result}
+								<button 
+									on:click={() => openFileFromPath(result.path)}
+									class="w-full text-left bg-slate-800/50 hover:bg-slate-800 rounded p-2 border border-slate-700/50 group"
+								>
+									<div class="flex items-center gap-2 mb-1">
+										<File class="w-3 h-3 text-slate-400 flex-shrink-0" />
+										<span class="text-xs text-slate-300 font-mono truncate flex-1">{result.path}</span>
+										<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400">
+											{result.match_type}
+										</span>
+									</div>
+									{#if result.matches && result.matches.length > 0}
+										<div class="mt-1 space-y-0.5">
+											{#each result.matches.slice(0, 3) as match}
+												<div class="text-[10px] text-slate-500 font-mono pl-4">
+													<span class="text-slate-600">{match.line}:</span> {match.content}
+												</div>
+											{/each}
+											{#if result.matches.length > 3}
+												<div class="text-[10px] text-slate-600 pl-4">
+													+{result.matches.length - 3} more matches
+												</div>
+											{/if}
+										</div>
+									{/if}
+								</button>
+							{/each}
+						</div>
+					{:else}
+						<div class="text-xs text-slate-500 text-center py-8">
+							Enter a search query to find files
+						</div>
+					{/if}
 				</div>
 			</div>
-		{:else if activeExplorerTab === 'git'}
+		{:else if activeExplorerTab === 'history'}
 			<!-- Chat History Panel -->
 			<div class="flex-1 flex flex-col overflow-hidden">
 				<div class="px-2 py-2 flex items-center justify-between border-b border-slate-800/30">
@@ -1153,6 +1813,248 @@ if __name__ == "__main__":
 								</button>
 							</div>
 						{/each}
+					{/if}
+				</div>
+			</div>
+		{:else if activeExplorerTab === 'git'}
+			<!-- Source Control Panel - Full VS Code-like Git Integration -->
+			<div class="flex-1 flex flex-col overflow-hidden">
+				<div class="px-2 py-2 flex items-center justify-between border-b border-slate-800/30">
+					<span class="text-xs font-semibold text-slate-300">SOURCE CONTROL</span>
+					<div class="flex items-center gap-1">
+						<button 
+							on:click={() => { loadGitStatus(); loadGitBranches(); loadGitLog(); }}
+							class="p-1 hover:bg-slate-700/50 rounded"
+							title="Refresh"
+						>
+							<RefreshCw class="w-3 h-3 text-slate-400" />
+						</button>
+					</div>
+				</div>
+				
+				<div class="flex-1 overflow-y-auto">
+					{#if !isGitRepo}
+						<!-- Initialize Repository -->
+						<div class="p-4">
+							<div class="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50 mb-4">
+								<p class="text-xs text-slate-300 mb-3">This workspace is not a Git repository.</p>
+								<button 
+									on:click={initGitRepo}
+									class="w-full bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 text-white text-xs font-bold py-2 rounded transition-all"
+								>
+									Initialize Repository
+								</button>
+							</div>
+						</div>
+					{:else}
+						<!-- Git Status -->
+						{#if gitStatus}
+							<!-- Current Branch & Branch Management -->
+							{#if gitStatus.current_branch}
+								<div class="px-3 py-2 border-b border-slate-800/30">
+									<div class="flex items-center justify-between">
+										<div class="flex items-center gap-2">
+											<GitBranch class="w-3 h-3 text-amber-500" />
+											<span class="text-xs text-slate-300 font-mono">{gitStatus.current_branch}</span>
+										</div>
+										<button 
+											on:click={() => { loadGitBranches(); }}
+											class="p-1 hover:bg-slate-700/50 rounded"
+											title="Refresh branches"
+										>
+											<RefreshCw class="w-3 h-3 text-slate-400" />
+										</button>
+									</div>
+									<!-- Branches List -->
+									{#if gitBranches && gitBranches.length > 0}
+										<div class="mt-2 space-y-1">
+											{#each gitBranches.filter(b => !b.is_remote) as branch}
+												<div 
+													class="flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-800/50 {branch.is_current ? 'bg-slate-800/70' : ''}"
+												>
+													<GitBranch class="w-3 h-3 {branch.is_current ? 'text-amber-500' : 'text-slate-500'}" />
+													<span class="text-xs text-slate-300 flex-1">{branch.name}</span>
+													{#if branch.is_current}
+														<span class="text-[10px] text-amber-500">current</span>
+													{:else}
+														<button 
+															on:click={() => {
+																fetch(`http://localhost:8000/api/v1/git/checkout?workspace_path=${encodeURIComponent(workspacePath)}`, {
+																	method: 'POST',
+																	headers: { 'Content-Type': 'application/json' },
+																	body: JSON.stringify({ name: branch.name })
+																}).then(() => { loadGitStatus(); loadGitBranches(); });
+															}}
+															class="text-[10px] text-amber-500 hover:text-amber-400"
+														>
+															Checkout
+														</button>
+													{/if}
+												</div>
+											{/each}
+										</div>
+									{/if}
+								</div>
+							{/if}
+							
+							<!-- Staged Changes -->
+							{#if gitStatus.staged && gitStatus.staged.length > 0}
+								<div class="px-2 py-1">
+									<div class="text-[10px] font-bold text-slate-400 uppercase mb-1 px-2">STAGED CHANGES</div>
+									{#each gitStatus.staged as file}
+										<div class="px-2 py-1 flex items-center gap-2 hover:bg-slate-800/50 group">
+											<File class="w-3 h-3 text-green-400" />
+											<span class="text-xs text-slate-300 flex-1 truncate">{file}</span>
+											<button 
+												on:click={() => unstageFiles([file])}
+												class="p-0.5 opacity-0 group-hover:opacity-100 hover:bg-red-500/20 rounded"
+											>
+												<X class="w-3 h-3 text-red-400" />
+											</button>
+										</div>
+									{/each}
+								</div>
+							{/if}
+							
+							<!-- Unstaged Changes -->
+							{#if gitStatus.unstaged && gitStatus.unstaged.length > 0}
+								<div class="px-2 py-1">
+									<div class="text-[10px] font-bold text-slate-400 uppercase mb-1 px-2">CHANGES</div>
+									{#each gitStatus.unstaged as file}
+										<div class="px-2 py-1 flex items-center gap-2 hover:bg-slate-800/50 group">
+											<File class="w-3 h-3 text-amber-400" />
+											<span class="text-xs text-slate-300 flex-1 truncate">{file}</span>
+											<button 
+												on:click={() => stageFiles([file])}
+												class="p-0.5 opacity-0 group-hover:opacity-100 hover:bg-green-500/20 rounded"
+											>
+												<Plus class="w-3 h-3 text-green-400" />
+											</button>
+										</div>
+									{/each}
+								</div>
+							{/if}
+							
+							<!-- Untracked Files -->
+							{#if gitStatus.untracked && gitStatus.untracked.length > 0}
+								<div class="px-2 py-1">
+									<div class="text-[10px] font-bold text-slate-400 uppercase mb-1 px-2">UNTRACKED</div>
+									{#each gitStatus.untracked as file}
+										<div class="px-2 py-1 flex items-center gap-2 hover:bg-slate-800/50 group">
+											<File class="w-3 h-3 text-slate-500" />
+											<span class="text-xs text-slate-300 flex-1 truncate">{file}</span>
+											<button 
+												on:click={() => stageFiles([file])}
+												class="p-0.5 opacity-0 group-hover:opacity-100 hover:bg-green-500/20 rounded"
+											>
+												<Plus class="w-3 h-3 text-green-400" />
+											</button>
+										</div>
+									{/each}
+								</div>
+							{/if}
+							
+							<!-- Commit Section -->
+							<div class="px-2 py-2 border-t border-slate-800/30 mt-2">
+								<textarea 
+									bind:value={commitMessage}
+									placeholder="Message (Ctrl+Enter to commit)"
+									class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs text-slate-200 mb-2 outline-none focus:border-amber-500 resize-none"
+									rows="3"
+									on:keydown={(e) => { if (e.ctrlKey && e.key === 'Enter') createCommit(); }}
+								></textarea>
+								<button 
+									on:click={createCommit}
+									disabled={!commitMessage.trim() || (gitStatus.staged?.length === 0 && gitStatus.unstaged?.length === 0)}
+									class="w-full bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 disabled:from-slate-700 disabled:to-slate-700 disabled:cursor-not-allowed text-white text-xs font-bold py-1.5 rounded transition-all"
+								>
+									Commit
+								</button>
+							</div>
+							
+							<!-- Remote Actions -->
+							{#if gitStatus.remotes && Object.keys(gitStatus.remotes).length > 0}
+								<div class="px-2 py-2 border-t border-slate-800/30">
+									<div class="flex gap-1">
+										<button 
+											on:click={pullFromRemote}
+											class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold py-1.5 rounded transition-all"
+										>
+											Pull
+										</button>
+										<button 
+											on:click={pushToRemote}
+											class="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold py-1.5 rounded transition-all"
+										>
+											Push
+										</button>
+									</div>
+								</div>
+							{/if}
+							
+							<!-- GitHub Integration -->
+							<div class="px-2 py-2 border-t border-slate-800/30">
+								{#if !githubAuthenticated}
+									<button 
+										on:click={() => showGitHubAuth = !showGitHubAuth}
+										class="w-full bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold py-1.5 rounded transition-all mb-2"
+									>
+										Connect to GitHub
+									</button>
+									{#if showGitHubAuth}
+										<div class="bg-slate-900 rounded p-2 mb-2">
+											<input 
+												type="password"
+												bind:value={githubToken}
+												placeholder="GitHub Personal Access Token"
+												class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 mb-2 outline-none focus:border-amber-500"
+											/>
+											<button 
+												on:click={saveGitHubToken}
+												class="w-full bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 text-white text-xs font-bold py-1 rounded transition-all"
+											>
+												Save Token
+											</button>
+										</div>
+									{/if}
+								{:else}
+									<div class="mb-2">
+										<div class="text-xs text-slate-400 mb-1">Connected as: {githubUser?.login || 'GitHub User'}</div>
+										<button 
+											on:click={() => showCreateRepo = !showCreateRepo}
+											class="w-full bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold py-1.5 rounded transition-all"
+										>
+											Publish to GitHub
+										</button>
+										{#if showCreateRepo}
+											<div class="bg-slate-900 rounded p-2 mt-2">
+												<input 
+													bind:value={newRepoName}
+													placeholder="Repository name"
+													class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 mb-2 outline-none focus:border-amber-500"
+												/>
+												<input 
+													bind:value={newRepoDescription}
+													placeholder="Description (optional)"
+													class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 mb-2 outline-none focus:border-amber-500"
+												/>
+												<label class="flex items-center gap-2 text-xs text-slate-300 mb-2">
+													<input type="checkbox" bind:checked={newRepoPrivate} class="accent-amber-500" />
+													Private repository
+												</label>
+												<button 
+													on:click={createGitHubRepo}
+													disabled={!newRepoName.trim()}
+													class="w-full bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 disabled:from-slate-700 disabled:to-slate-700 disabled:cursor-not-allowed text-white text-xs font-bold py-1 rounded transition-all"
+												>
+													Create & Publish
+												</button>
+											</div>
+										{/if}
+									</div>
+								{/if}
+							</div>
+						{/if}
 					{/if}
 				</div>
 			</div>
@@ -1432,6 +2334,363 @@ if __name__ == "__main__":
 										</button>
 									</div>
 									<p class="text-[10px] text-slate-400 line-clamp-2">{rule.content}</p>
+								</div>
+							{/each}
+						</div>
+					{/if}
+				</div>
+			</div>
+		{/if}
+
+		<!-- Memory Bank Panel -->
+		{#if showMemoriesPanel}
+			<div class="absolute right-6 top-20 w-[450px] bg-slate-900 border border-slate-700/50 rounded-xl shadow-2xl z-50 p-6 animate-in slide-in-from-right backdrop-blur-xl max-h-[80vh] overflow-y-auto">
+				<div class="flex items-center justify-between mb-6">
+					<div class="flex items-center gap-3">
+						<div class="w-10 h-10 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-600 flex items-center justify-center">
+							<MessageSquare class="w-5 h-5 text-white" />
+						</div>
+						<h3 class="text-base font-bold text-white">Memory Bank</h3>
+					</div>
+					<button on:click={() => showMemoriesPanel = false} class="text-slate-400 hover:text-white">
+						<X class="w-5 h-5" />
+					</button>
+				</div>
+				
+				<p class="text-xs text-slate-400 mb-4">
+					Memories are automatically extracted when you say "remember that..." or when the model decides to remember important information. These are injected into future conversations.
+				</p>
+
+				<!-- Search -->
+				<div class="mb-4">
+					<input 
+						type="text" 
+						bind:value={memorySearchQuery}
+						on:input={loadMemories}
+						placeholder="Search memories..."
+						class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+					/>
+				</div>
+
+				<!-- Memories List -->
+				<div class="space-y-2">
+					{#if memories.length === 0}
+						<div class="text-xs text-slate-500 italic text-center py-8">
+							No memories yet. Say "remember that..." in a conversation to create one!
+						</div>
+					{:else}
+						{#each memories as memory}
+							<div class="bg-slate-800/50 rounded-lg p-3 border border-slate-700/50">
+								<div class="flex items-start justify-between mb-2">
+									<div class="flex items-center gap-2">
+										<span class="text-[10px] px-2 py-0.5 rounded {memory.source === 'user' ? 'bg-blue-500/20 text-blue-400' : 'bg-purple-500/20 text-purple-400'} uppercase font-bold">
+											{memory.source}
+										</span>
+										{#if memory.tags}
+											<span class="text-[10px] text-slate-500">{memory.tags}</span>
+										{/if}
+									</div>
+									<button on:click={() => deleteMemory(memory.id)} class="p-1 hover:bg-red-500/20 rounded">
+										<Trash2 class="w-3 h-3 text-red-400" />
+									</button>
+								</div>
+								<p class="text-xs text-slate-300 leading-relaxed">{memory.content}</p>
+								<div class="flex items-center gap-3 mt-2 text-[10px] text-slate-500">
+									<span>Accessed {memory.access_count} times</span>
+									<span>•</span>
+									<span>{new Date(memory.created_at).toLocaleDateString()}</span>
+								</div>
+							</div>
+						{/each}
+					{/if}
+				</div>
+			</div>
+		{/if}
+
+		<!-- MCP Servers Panel -->
+		{#if showMCPServersPanel}
+			<div class="absolute right-6 top-20 w-[500px] bg-slate-900 border border-slate-700/50 rounded-xl shadow-2xl z-50 p-6 animate-in slide-in-from-right backdrop-blur-xl max-h-[80vh] overflow-y-auto">
+				<div class="flex items-center justify-between mb-6">
+					<div class="flex items-center gap-3">
+						<div class="w-10 h-10 rounded-lg bg-gradient-to-br from-green-500 to-emerald-600 flex items-center justify-center">
+							<Code2 class="w-5 h-5 text-white" />
+						</div>
+						<h3 class="text-base font-bold text-white">MCP Servers & Tools</h3>
+					</div>
+					<button on:click={() => showMCPServersPanel = false} class="text-slate-400 hover:text-white">
+						<X class="w-5 h-5" />
+					</button>
+				</div>
+				
+				<p class="text-xs text-slate-400 mb-4">
+					Manage MCP (Model Context Protocol) servers to add custom tools. Tools are dynamically discovered and registered.
+				</p>
+
+				<!-- Available Tools -->
+				<div class="mb-6">
+					<h4 class="text-xs font-bold text-slate-400 uppercase mb-2">Available Tools ({availableTools.length})</h4>
+					<div class="bg-slate-950 rounded-lg p-3 max-h-40 overflow-y-auto">
+						{#if availableTools.length === 0}
+							<div class="text-xs text-slate-500 italic">No tools available</div>
+						{:else}
+							<div class="space-y-1">
+								{#each availableTools as tool}
+									<div class="flex items-center gap-2 text-xs">
+										<span class="text-slate-300 font-mono">{tool.name}</span>
+										<span class="text-[10px] px-1.5 py-0.5 rounded {tool.source === 'fallback' ? 'bg-amber-500/20 text-amber-400' : tool.source === 'mcp' ? 'bg-green-500/20 text-green-400' : 'bg-blue-500/20 text-blue-400'}">
+											{tool.source}
+										</span>
+										{#if tool.description}
+											<span class="text-slate-500 text-[10px]">- {tool.description}</span>
+										{/if}
+									</div>
+								{/each}
+							</div>
+						{/if}
+					</div>
+				</div>
+
+				<!-- Add New MCP Server -->
+				<div class="bg-slate-950 rounded-lg p-4 border border-slate-700 mb-4 max-h-[70vh] overflow-y-auto">
+					<h4 class="text-xs font-bold text-slate-400 uppercase mb-3">Add MCP Server</h4>
+					
+					<!-- Server Name -->
+					<div class="mb-3">
+						<label class="block text-xs text-slate-300 mb-1">Server Name *</label>
+						<input 
+							type="text" 
+							bind:value={newMCPServerName}
+							placeholder="e.g., github-mcp, filesystem-mcp"
+							class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+						/>
+					</div>
+
+					<!-- Transport Type -->
+					<div class="mb-3">
+						<label class="block text-xs text-slate-300 mb-1">Transport Type *</label>
+						<select 
+							bind:value={newMCPServerTransport}
+							class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+						>
+							<option value="stdio">stdio (Standard I/O)</option>
+							<option value="http">HTTP</option>
+							<option value="sse">SSE (Server-Sent Events)</option>
+						</select>
+					</div>
+
+					<!-- Command (for stdio) -->
+					{#if newMCPServerTransport === 'stdio'}
+						<div class="mb-3">
+							<label class="block text-xs text-slate-300 mb-1">Command *</label>
+							<input 
+								type="text" 
+								bind:value={newMCPServerCommand}
+								placeholder="e.g., npx, python, node"
+								class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+							/>
+						</div>
+
+						<!-- Command Arguments -->
+						<div class="mb-3">
+							<label class="block text-xs text-slate-300 mb-1">Command Arguments</label>
+							<div class="flex gap-2 mb-2">
+								<input 
+									type="text" 
+									bind:value={newMCPServerArgInput}
+									on:keydown={(e) => e.key === 'Enter' && addMCPServerArg()}
+									placeholder="e.g., -y, @modelcontextprotocol/server-github"
+									class="flex-1 bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+								/>
+								<button 
+									on:click={addMCPServerArg}
+									class="px-3 py-2 bg-slate-800 border border-slate-700 rounded text-xs text-slate-300 hover:bg-slate-700"
+								>
+									Add
+								</button>
+							</div>
+							{#if newMCPServerArgs.length > 0}
+								<div class="flex flex-wrap gap-1">
+									{#each newMCPServerArgs as arg, i}
+										<div class="flex items-center gap-1 bg-slate-800 px-2 py-1 rounded text-xs text-slate-300">
+											<span>{arg}</span>
+											<button 
+												on:click={() => removeMCPServerArg(i)}
+												class="text-red-400 hover:text-red-300"
+											>
+												<X class="w-3 h-3" />
+											</button>
+										</div>
+									{/each}
+								</div>
+							{/if}
+						</div>
+					{/if}
+
+					<!-- HTTP URL (for http transport) -->
+					{#if newMCPServerTransport === 'http'}
+						<div class="mb-3">
+							<label class="block text-xs text-slate-300 mb-1">HTTP URL *</label>
+							<input 
+								type="text" 
+								bind:value={newMCPServerHttpUrl}
+								placeholder="e.g., http://localhost:3000/mcp"
+								class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+							/>
+						</div>
+					{/if}
+
+					<!-- Working Directory -->
+					<div class="mb-3">
+						<label class="block text-xs text-slate-300 mb-1">Working Directory (optional)</label>
+						<input 
+							type="text" 
+							bind:value={newMCPServerCwd}
+							placeholder="e.g., /path/to/workspace"
+							class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+						/>
+					</div>
+
+					<!-- Environment Variables -->
+					<div class="mb-3">
+						<label class="block text-xs text-slate-300 mb-1">Environment Variables</label>
+						<div class="flex gap-2 mb-2">
+							<input 
+								type="text" 
+								bind:value={newMCPServerEnvKey}
+								placeholder="Key"
+								class="flex-1 bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+							/>
+							<input 
+								type="text" 
+								bind:value={newMCPServerEnvValue}
+								on:keydown={(e) => e.key === 'Enter' && addMCPServerEnvVar()}
+								placeholder="Value"
+								class="flex-1 bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+							/>
+							<button 
+								on:click={addMCPServerEnvVar}
+								class="px-3 py-2 bg-slate-800 border border-slate-700 rounded text-xs text-slate-300 hover:bg-slate-700"
+							>
+								Add
+							</button>
+						</div>
+						{#if newMCPServerEnvVars.length > 0}
+							<div class="space-y-1">
+								{#each newMCPServerEnvVars as env, i}
+									<div class="flex items-center gap-2 bg-slate-800 px-2 py-1 rounded text-xs">
+										<span class="text-slate-300 font-mono">{env.key}</span>
+										<span class="text-slate-500">=</span>
+										<span class="text-slate-400 flex-1 truncate">{env.value}</span>
+										<button 
+											on:click={() => removeMCPServerEnvVar(i)}
+											class="text-red-400 hover:text-red-300"
+										>
+											<X class="w-3 h-3" />
+										</button>
+									</div>
+								{/each}
+							</div>
+						{/if}
+					</div>
+
+					<!-- Manual Tool Configuration (optional) -->
+					<div class="mb-3">
+						<label class="block text-xs text-slate-300 mb-1">Tools (optional - auto-discovered if not specified)</label>
+						<div class="space-y-2 mb-2">
+							<input 
+								type="text" 
+								bind:value={newMCPServerToolName}
+								placeholder="Tool name"
+								class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+							/>
+							<input 
+								type="text" 
+								bind:value={newMCPServerToolDesc}
+								placeholder="Tool description"
+								class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500"
+							/>
+							<textarea 
+								bind:value={newMCPServerToolParams}
+								placeholder="Parameters JSON (e.g., query: string)"
+								rows="2"
+								class="w-full bg-slate-900 border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 outline-none focus:border-amber-500 resize-none font-mono"
+							></textarea>
+							<button 
+								on:click={addMCPServerTool}
+								class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded text-xs text-slate-300 hover:bg-slate-700"
+							>
+								Add Tool
+							</button>
+						</div>
+						{#if newMCPServerTools.length > 0}
+							<div class="space-y-1">
+								{#each newMCPServerTools as tool, i}
+									<div class="bg-slate-800 px-2 py-1 rounded text-xs">
+										<div class="flex items-center justify-between">
+											<div class="flex-1">
+												<span class="text-slate-300 font-mono font-bold">{tool.name}</span>
+												{#if tool.description}
+													<span class="text-slate-500 ml-2">- {tool.description}</span>
+												{/if}
+											</div>
+											<button 
+												on:click={() => removeMCPServerTool(i)}
+												class="text-red-400 hover:text-red-300"
+											>
+												<X class="w-3 h-3" />
+											</button>
+										</div>
+									</div>
+								{/each}
+							</div>
+						{/if}
+					</div>
+
+					<!-- Submit Button -->
+					<button 
+						on:click={createMCPServer}
+						disabled={!newMCPServerName.trim() || (newMCPServerTransport === 'stdio' && !newMCPServerCommand.trim()) || (newMCPServerTransport === 'http' && !newMCPServerHttpUrl.trim())}
+						class="w-full bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 disabled:from-slate-700 disabled:to-slate-700 disabled:cursor-not-allowed text-white text-xs font-bold py-2 rounded transition-all"
+					>
+						Add MCP Server
+					</button>
+				</div>
+
+				<!-- MCP Servers List -->
+				<div>
+					<h4 class="text-xs font-bold text-slate-400 uppercase mb-2">Configured Servers</h4>
+					{#if mcpServers.length === 0}
+						<div class="text-xs text-slate-500 italic text-center py-4">
+							No MCP servers configured
+						</div>
+					{:else}
+						<div class="space-y-2">
+							{#each mcpServers as server}
+								<div class="bg-slate-800/50 rounded-lg p-3 border border-slate-700/50">
+									<div class="flex items-center justify-between mb-2">
+										<div class="flex items-center gap-2">
+											<span class="text-xs font-bold text-slate-300">{server.name}</span>
+											<span class="text-[10px] px-1.5 py-0.5 rounded {server.enabled ? 'bg-green-500/20 text-green-400' : 'bg-slate-500/20 text-slate-400'}">
+												{server.enabled ? 'enabled' : 'disabled'}
+											</span>
+										</div>
+										<div class="flex items-center gap-1">
+											<button 
+												on:click={() => reloadMCPServer(server.name)}
+												class="p-1 hover:bg-blue-500/20 rounded"
+												title="Reload tools"
+											>
+												<RefreshCw class="w-3 h-3 text-blue-400" />
+											</button>
+											<button 
+												on:click={() => deleteMCPServer(server.name)}
+												class="p-1 hover:bg-red-500/20 rounded"
+											>
+												<Trash2 class="w-3 h-3 text-red-400" />
+											</button>
+										</div>
+									</div>
+									<pre class="text-[10px] text-slate-500 overflow-x-auto">{JSON.stringify(server.config, null, 2)}</pre>
 								</div>
 							{/each}
 						</div>

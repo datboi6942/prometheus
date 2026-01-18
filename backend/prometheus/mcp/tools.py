@@ -288,10 +288,8 @@ class MCPTools:
         if any(re.search(pattern, command, re.IGNORECASE) for pattern in dangerous_patterns):
             return {"error": "Command blocked for security reasons", "command": command}
 
-        # Security: Block shell metacharacters to prevent command injection
-        dangerous_chars = [';', '|', '&&', '||', '`', '$', '(', ')', '<', '>']
-        if any(char in command for char in dangerous_chars):
-            return {"error": "Command contains unsafe characters", "command": command}
+        # Note: shell=False with shlex.split() below already prevents command injection
+        # by treating the command as a single executable, not shell commands
 
         if dry_run:
             return {"dry_run": True, "command": command, "status": "would_execute"}

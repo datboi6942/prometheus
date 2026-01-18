@@ -8,6 +8,7 @@ class Settings(BaseSettings):
         ollama_base_url (str): The base URL for the local Ollama instance.
         default_model (str): The default LLM model to use for inference.
         workspace_path (str): Path to the user's workspace directory.
+        database_path (str): Path to the database directory for persistence.
         log_level (str): Logging level (e.g., INFO, DEBUG).
         debug (bool): Whether to enable debug mode.
     """
@@ -15,6 +16,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     default_model: str = "ollama/llama3.2"
     workspace_path: str = "/tmp/prometheus_workspace"
+    database_path: str = "/tmp/prometheus_data"
     log_level: str = "INFO"
     debug: bool = False
 

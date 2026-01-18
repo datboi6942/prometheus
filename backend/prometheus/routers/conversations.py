@@ -49,6 +49,16 @@ class SaveSettingRequest(BaseModel):
     value: str
 
 
+class CreateMemoryRequest(BaseModel):
+    """Request model for creating a memory."""
+
+    content: str
+    source: str  # 'user' or 'model'
+    workspace_path: str | None = None
+    conversation_id: str | None = None
+    tags: str | None = None
+
+
 # Conversation endpoints
 @router.get("/conversations")
 async def list_conversations() -> dict[str, Any]:
@@ -298,4 +308,63 @@ async def delete_setting(key: str) -> dict[str, Any]:
         dict: Success status.
     """
     await db.delete_setting(key)
+    return {"success": True}
+
+
+# Memory endpoints
+@router.get("/memories")
+async def list_memories(
+    workspace_path: str | None = None,
+    search: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """List memories.
+
+    Args:
+        workspace_path: Optional workspace path to filter by.
+        search: Optional search query.
+        limit: Maximum number of memories to return.
+
+    Returns:
+        dict: List of memories.
+    """
+    memories = await db.get_memories(
+        workspace_path=workspace_path,
+        search_query=search,
+        limit=limit,
+    )
+    return {"memories": memories}
+
+
+@router.post("/memories")
+async def create_memory(request: CreateMemoryRequest) -> dict[str, Any]:
+    """Create a memory.
+
+    Args:
+        request: Memory details.
+
+    Returns:
+        dict: Created memory.
+    """
+    memory = await db.add_memory(
+        content=request.content,
+        source=request.source,
+        workspace_path=request.workspace_path,
+        conversation_id=request.conversation_id,
+        tags=request.tags,
+    )
+    return {"memory": memory}
+
+
+@router.delete("/memories/{memory_id}")
+async def delete_memory(memory_id: int) -> dict[str, Any]:
+    """Delete a memory.
+
+    Args:
+        memory_id: Memory ID.
+
+    Returns:
+        dict: Success status.
+    """
+    await db.delete_memory(memory_id)
     return {"success": True}

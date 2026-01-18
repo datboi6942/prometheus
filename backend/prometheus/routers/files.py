@@ -130,3 +130,93 @@ async def delete_file(
         raise HTTPException(status_code=status_code, detail=result["error"])
 
     return result
+
+
+@router.get("/search")
+async def search_files(
+    query: str = Query(..., description="Search query (filename or content)"),
+    path: str = Query(default="", description="Relative path to search within (empty for root)"),
+    search_content: bool = Query(default=False, description="Search file contents in addition to filenames"),
+    mcp_tools: Annotated[MCPTools, Depends(get_mcp_tools)] = None,
+) -> dict:
+    """Search for files in the workspace.
+
+    Args:
+        query (str): Search query (filename or content).
+        path (str): Relative path to search within (empty for root).
+        search_content (bool): Whether to search file contents.
+        mcp_tools (MCPTools): Injected MCP tools instance.
+
+    Returns:
+        dict: Search results with matching files.
+    """
+    import os
+    from pathlib import Path
+    
+    workspace_path = mcp_tools.workspace_path
+    search_path = workspace_path / path if path else workspace_path
+    search_path = search_path.resolve()
+    
+    # Validate search path is within workspace
+    if not str(search_path).startswith(str(workspace_path)):
+        raise HTTPException(status_code=400, detail="Search path is outside workspace")
+    
+    if not search_path.exists():
+        raise HTTPException(status_code=404, detail="Search path does not exist")
+    
+    results = []
+    query_lower = query.lower()
+    
+    # Recursively search files
+    for root, dirs, files in os.walk(search_path):
+        # Skip hidden directories
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        
+        for file in files:
+            # Skip hidden files
+            if file.startswith('.'):
+                continue
+            
+            file_path = Path(root) / file
+            rel_path = file_path.relative_to(workspace_path)
+            
+            # Check filename match
+            if query_lower in file.lower():
+                results.append({
+                    "path": str(rel_path),
+                    "name": file,
+                    "match_type": "filename"
+                })
+                continue
+            
+            # Check content match if enabled
+            if search_content:
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        if query_lower in content.lower():
+                            # Find line numbers with matches
+                            lines = content.split('\n')
+                            matching_lines = []
+                            for i, line in enumerate(lines, 1):
+                                if query_lower in line.lower():
+                                    matching_lines.append({
+                                        "line": i,
+                                        "content": line.strip()[:100]  # First 100 chars
+                                    })
+                            
+                            results.append({
+                                "path": str(rel_path),
+                                "name": file,
+                                "match_type": "content",
+                                "matches": matching_lines[:10]  # Limit to first 10 matches
+                            })
+                except Exception:
+                    # Skip files that can't be read (binary, permissions, etc.)
+                    pass
+    
+    return {
+        "query": query,
+        "results": results,
+        "count": len(results)
+    }
