@@ -65,22 +65,13 @@ def get_model_context_limit(model: str) -> int:
     """
     logger.info("Getting context limit for model", model=model)
 
-    # Try using LiteLLM's built-in limit detection
-    try:
-        max_tokens = litellm.get_max_tokens(model)
-        if max_tokens and max_tokens > 0:
-            logger.info("Got context limit from LiteLLM", model=model, max_tokens=max_tokens)
-            return max_tokens
-    except Exception as e:
-        logger.debug("Could not get max tokens from LiteLLM", model=model, error=str(e))
-
-    # Fall back to our configuration
     # Extract base model name (handle "provider/model" format)
     base_model = model.split("/")[-1].lower()
     model_lower = model.lower()
     logger.info("Extracted base model name", original=model, base_model=base_model)
 
     # Check for DeepSeek models specifically first (high priority)
+    # Use our manual config for DeepSeek since LiteLLM's detection is unreliable
     if "deepseek" in model_lower:
         if "chat" in base_model or "v3" in base_model or "v2" in base_model:
             logger.info("Matched DeepSeek Chat model", model=model, limit=MODEL_CONTEXT_LIMITS["deepseek-chat"])
@@ -88,6 +79,15 @@ def get_model_context_limit(model: str) -> int:
         elif "reasoner" in base_model or "r1" in base_model:
             logger.info("Matched DeepSeek Reasoner model", model=model, limit=MODEL_CONTEXT_LIMITS["deepseek-reasoner"])
             return MODEL_CONTEXT_LIMITS["deepseek-reasoner"]
+
+    # Try using LiteLLM's built-in limit detection for other models
+    try:
+        max_tokens = litellm.get_max_tokens(model)
+        if max_tokens and max_tokens > 0:
+            logger.info("Got context limit from LiteLLM", model=model, max_tokens=max_tokens)
+            return max_tokens
+    except Exception as e:
+        logger.debug("Could not get max tokens from LiteLLM", model=model, error=str(e))
 
     # Check exact match
     if base_model in MODEL_CONTEXT_LIMITS:

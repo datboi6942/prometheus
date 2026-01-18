@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { 
+	import {
 		Cpu, MessageSquare, FileCode, Play, Sparkles,
 		FolderOpen, Plus, ChevronRight, X, Check, AlertCircle, Loader2,
 		Search, GitBranch, RefreshCw, Trash2, FilePlus, FolderPlus, Edit3,
-		ChevronDown, File, Folder
+		ChevronDown, File, Folder, Brain
 	} from 'lucide-svelte';
 	
 	// Import our refactored components
@@ -16,7 +16,8 @@
 	import TerminalPanel from '$lib/components/panels/TerminalPanel.svelte';
 	import GitPanel from '$lib/components/panels/GitPanel.svelte';
 	import DiffViewer from '$lib/components/chat/DiffViewer.svelte';
-	
+	import ThinkingBlock from '$lib/components/chat/ThinkingBlock.svelte';
+
 	// Import stores
 	import {
 		selectedModel, customEndpoint, customApiKey, apiKeys, workspacePath,
@@ -27,7 +28,7 @@
 		messages, chatInput, isLoading, isConnected, abortController,
 		currentOpenFile, editorHasUnsavedChanges, toolExecutions, activeToolCalls,
 		gitStatus, gitBranches, gitCommits, isGitRepo, githubAuthenticated, githubUser,
-		contextInfo
+		contextInfo, activeThinking
 	} from '$lib/stores';
 	
 	// Import API functions
@@ -900,12 +901,49 @@
 								}
 							}
 
+							// Handle thinking chunks (DeepSeek R1 reasoning)
+							if (data.thinking_chunk) {
+								if (!$activeThinking) {
+									// Start new thinking session
+									$activeThinking = {
+										content: data.thinking_chunk,
+										summary: null,
+										isActive: true,
+										isComplete: false
+									};
+								} else {
+									// Append to existing thinking
+									$activeThinking.content += data.thinking_chunk;
+								}
+								// Trigger reactivity
+								$activeThinking = $activeThinking;
+							}
+
+							// Handle thinking completion
+							if (data.thinking_complete) {
+								if ($activeThinking) {
+									$activeThinking.summary = data.thinking_complete.summary;
+									$activeThinking.isComplete = true;
+									$activeThinking.isActive = false;
+									$activeThinking = $activeThinking;
+
+									// Attach thinking to last assistant message
+									if ($messages.length > 0 && $messages[$messages.length - 1].role === 'assistant') {
+										$messages[$messages.length - 1].thinking = {
+											summary: data.thinking_complete.summary,
+											fullContent: $activeThinking.content
+										};
+										$messages = [...$messages];
+									}
+								}
+							}
+
 							// Handle errors
 							if (data.error) {
 								console.error('Stream error:', data.error);
 								addLog(`Error: ${data.error}`);
 							}
-							
+
 							// Handle OpenAI format (fallback)
 							if (data.choices?.[0]?.delta?.content) {
 								currentResponse += data.choices[0].delta.content;
@@ -927,6 +965,26 @@
 				addLog(`Error: ${error.message}`);
 			}
 		} finally {
+			// If thinking was active but never completed, generate fallback summary
+			if ($activeThinking && $activeThinking.isActive) {
+				const summary = $activeThinking.content.substring(0, 100) +
+							   ($activeThinking.content.length > 100 ? '...' : '');
+				$activeThinking.summary = summary;
+				$activeThinking.isActive = false;
+				$activeThinking.isComplete = true;
+
+				// Attach to message
+				if ($messages.length > 0 && $messages[$messages.length - 1].role === 'assistant') {
+					$messages[$messages.length - 1].thinking = {
+						summary: summary,
+						fullContent: $activeThinking.content
+					};
+					$messages = [...$messages];
+				}
+			}
+
+			// Clear active thinking
+			$activeThinking = null;
 			$isLoading = false;
 			$isConnected = false;
 		}
@@ -1356,13 +1414,26 @@
 										<Sparkles class="w-4 h-4 text-white" />
 									</div>
 								{/if}
-								<div class="max-w-2xl {msg.role === 'user' ? 'bg-amber-500/10 border-amber-500/30' : 'bg-slate-800/50 border-slate-700/50'} border rounded-xl p-4">
-									{#if msg.content}
-										<div class="text-sm text-slate-200 leading-relaxed markdown-content">
-											{@html formatMessageContent(msg.content)}
-										</div>
+								<div class="max-w-2xl space-y-2">
+									<!-- Thinking Block (for assistant messages with reasoning) -->
+									{#if msg.thinking && msg.role === 'assistant'}
+										<ThinkingBlock
+											summary={msg.thinking.summary}
+											fullContent={msg.thinking.fullContent}
+											isStreaming={false}
+											isExpanded={false}
+										/>
 									{/if}
-									<div class="text-[10px] text-slate-500 mt-2">{msg.timestamp.toLocaleTimeString()}</div>
+
+									<!-- Message Content -->
+									<div class="{msg.role === 'user' ? 'bg-amber-500/10 border-amber-500/30' : 'bg-slate-800/50 border-slate-700/50'} border rounded-xl p-4">
+										{#if msg.content}
+											<div class="text-sm text-slate-200 leading-relaxed markdown-content">
+												{@html formatMessageContent(msg.content)}
+											</div>
+										{/if}
+										<div class="text-[10px] text-slate-500 mt-2">{msg.timestamp.toLocaleTimeString()}</div>
+									</div>
 								</div>
 								{#if msg.role === 'user'}
 									<div class="w-8 h-8 rounded-lg bg-slate-700 flex items-center justify-center flex-shrink-0">
@@ -1404,6 +1475,23 @@
 								</div>
 							</div>
 						{/each}
+
+						<!-- Active Thinking (in progress) -->
+						{#if $activeThinking && $activeThinking.isActive}
+							<div class="flex gap-3">
+								<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-blue-600 flex items-center justify-center flex-shrink-0 animate-pulse">
+									<Brain class="w-4 h-4 text-white" />
+								</div>
+								<div class="max-w-2xl flex-1">
+									<ThinkingBlock
+										summary={$activeThinking.summary || "Thinking..."}
+										fullContent={$activeThinking.content}
+										isStreaming={true}
+										isExpanded={true}
+									/>
+								</div>
+							</div>
+						{/if}
 
 						<!-- Code Animations -->
 						{#each Array.from(activeCodeAnimations.values()) as animation}
