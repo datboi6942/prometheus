@@ -29,11 +29,12 @@ MODEL_CONTEXT_LIMITS = {
     "claude-3-haiku": 200000,
     "claude-3-5-sonnet": 200000,
     "claude-3-5-haiku": 200000,
-    # DeepSeek models (can handle up to ~171K with extended context)
-    "deepseek-chat": 171000,  # DeepSeek-V2/V3 Chat
-    "deepseek-reasoner": 171000,  # DeepSeek R1
-    "deepseek-v3": 171000,
-    "deepseek-v2": 171000,
+    # DeepSeek models
+    # API limits are more conservative than model capabilities
+    "deepseek-chat": 64000,  # DeepSeek Chat API endpoint (input+output)
+    "deepseek-reasoner": 131072,  # DeepSeek R1
+    "deepseek-v3": 64000,  # DeepSeek V3 via API (model supports 128K, API limits to 64K)
+    "deepseek-v2": 64000,
     # Google models
     "gemini-pro": 32768,
     "gemini-1.5-pro": 1000000,
