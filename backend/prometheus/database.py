@@ -248,6 +248,27 @@ async def init_db() -> None:
 
         await db.commit()
 
+        # Run migrations
+        await _migrate_add_thinking_columns(db)
+
+
+async def _migrate_add_thinking_columns(db: aiosqlite.Connection) -> None:
+    """Add thinking_summary and thinking_content columns to messages table if they don't exist.
+
+    Note: SQLite ALTER TABLE ADD COLUMN is a fast metadata-only operation that doesn't
+    rewrite the table, so lock time is minimal even for large tables.
+    """
+    # Check if columns already exist
+    cursor = await db.execute("PRAGMA table_info(messages)")
+    columns = await cursor.fetchall()
+    column_names = [col[1] for col in columns]
+
+    # Add both columns in sequence (already in init_db transaction)
+    if "thinking_summary" not in column_names:
+        await db.execute("ALTER TABLE messages ADD COLUMN thinking_summary TEXT")
+    if "thinking_content" not in column_names:
+        await db.execute("ALTER TABLE messages ADD COLUMN thinking_content TEXT")
+
 
 # Conversation functions
 async def create_conversation(
@@ -347,6 +368,8 @@ async def add_message(
     conversation_id: str,
     role: str,
     content: str,
+    thinking_summary: str | None = None,
+    thinking_content: str | None = None,
 ) -> dict[str, Any]:
     """Add a message to a conversation.
 
@@ -354,6 +377,8 @@ async def add_message(
         conversation_id: Conversation ID.
         role: Message role (user, assistant, system).
         content: Message content.
+        thinking_summary: Optional thinking summary for reasoning models.
+        thinking_content: Optional full thinking content for reasoning models.
 
     Returns:
         dict: The created message.
@@ -362,10 +387,10 @@ async def add_message(
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
-            INSERT INTO messages (conversation_id, role, content, timestamp)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO messages (conversation_id, role, content, thinking_summary, thinking_content, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (conversation_id, role, content, now),
+            (conversation_id, role, content, thinking_summary, thinking_content, now),
         )
         msg_id = cursor.lastrowid
         # Update conversation timestamp
@@ -380,6 +405,8 @@ async def add_message(
         "conversation_id": conversation_id,
         "role": role,
         "content": content,
+        "thinking_summary": thinking_summary,
+        "thinking_content": thinking_content,
         "timestamp": now,
     }
 

@@ -16,7 +16,7 @@ from prometheus.database import (
 from prometheus.mcp.tools import MCPTools
 from prometheus.routers.health import get_model_router
 from prometheus.services.model_router import ModelRouter
-from prometheus.services.context_manager import check_and_compress_if_needed
+from prometheus.services.context_manager import check_and_compress_if_needed, model_is_reasoning
 
 router = APIRouter(prefix="/api/v1")
 logger = structlog.get_logger()
@@ -382,49 +382,59 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
             while iteration < max_iterations:
                 iteration += 1
                 accumulated_response = ""
-                last_sent_length = 0
+                accumulated_reasoning = ""
+                reasoning_complete = False
                 tool_calls_found = []
-                
-                logger.info("Starting model stream", iteration=iteration, message_count=len(current_messages))
-                
-                # Stream model response
+
+                # Detect if this is a reasoning model (streams thinking separately from content)
+                model_is_reasoning = model_is_reasoning(request.model)
+
+                logger.info("Starting model stream", iteration=iteration, message_count=len(current_messages), model_is_reasoning=model_is_reasoning)
+
+                # Stream model response - buffer entire response to prevent tool JSON from leaking
                 async for chunk in model_router.stream(
                     model=request.model,
                     messages=current_messages,
                     api_base=request.api_base,
                     api_key=api_key_to_use,  # Use the determined API key
                 ):
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        accumulated_response += content
+                    if chunk.choices and chunk.choices[0].delta:
+                        delta = chunk.choices[0].delta
 
-                        # More aggressive buffering to prevent JSON from leaking through
-                        # Check if we're potentially in a tool call by looking for opening braces
-                        # followed by "tool" keyword
-                        open_braces = accumulated_response.count('{') - accumulated_response.count('}')
-                        # Look at a larger window to catch tool calls early
-                        recent_chunk = accumulated_response[max(0, len(accumulated_response) - 100):]
+                        # Extract reasoning content from provider_specific_fields (DeepSeek R1)
+                        if hasattr(delta, 'provider_specific_fields') and delta.provider_specific_fields:
+                            reasoning_chunk = delta.provider_specific_fields.get("reasoning_content", "")
+                            if reasoning_chunk:
+                                accumulated_reasoning += reasoning_chunk
+                                # Stream thinking chunk to frontend
+                                thinking_data = json.dumps({"thinking_chunk": reasoning_chunk})
+                                yield f"data: {thinking_data}\n\n"
 
-                        # Check for various tool call patterns
-                        has_tool_pattern = (
-                            '{"tool"' in recent_chunk or
-                            '{ "tool"' in recent_chunk or
-                            '"tool":' in recent_chunk or
-                            '"tool" :' in recent_chunk
-                        )
-                        has_args = '"args"' in recent_chunk
+                        # Handle regular content
+                        if delta.content:
+                            content = delta.content
 
-                        # If we have open braces and see tool/args keywords, we're likely in a tool call
-                        looks_like_json_start = (open_braces > 0 and (has_tool_pattern or has_args))
+                            # If we have reasoning and this is the first regular content, send thinking_complete
+                            if accumulated_reasoning and not reasoning_complete:
+                                reasoning_complete = True
+                                # Generate summary (first 100 chars)
+                                summary = accumulated_reasoning[:100] + "..." if len(accumulated_reasoning) > 100 else accumulated_reasoning
+                                complete_data = json.dumps({
+                                    "thinking_complete": {
+                                        "summary": summary,
+                                        "full_content": accumulated_reasoning
+                                    }
+                                })
+                                yield f"data: {complete_data}\n\n"
+                                logger.info("Thinking complete, transitioning to response", reasoning_length=len(accumulated_reasoning))
 
-                        if not looks_like_json_start:
-                            # Only send content if we're confident it's not a tool call
-                            new_content = accumulated_response[last_sent_length:]
+                            accumulated_response += content
 
-                            if new_content:
-                                last_sent_length = len(accumulated_response)
-                                data = json.dumps({"token": new_content})
-                                yield f"data: {data}\n\n"
+                            # Stream content immediately for reasoning models (they don't use tools)
+                            # Buffer for regular models to extract/strip tool calls
+                            if model_is_reasoning:
+                                token_data = json.dumps({"token": content})
+                                yield f"data: {token_data}\n\n"
 
                 # Extract tool calls ONCE after streaming completes (not on every chunk!)
                 tool_calls = extract_tool_calls(accumulated_response)
@@ -452,15 +462,11 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
                 # Strip tool calls from the complete response
                 clean_response = strip_tool_calls(accumulated_response)
 
-                # Send any remaining content that wasn't streamed (cleaned)
-                # Calculate what clean content we haven't sent yet
-                if last_sent_length < len(accumulated_response):
-                    # We have buffered content that wasn't sent (likely due to tool call detection)
-                    # Send the clean version now
-                    remaining_clean = clean_response[min(last_sent_length, len(clean_response)):]
-                    if remaining_clean.strip():
-                        final_data = json.dumps({"token": remaining_clean})
-                        yield f"data: {final_data}\n\n"
+                # Send the clean response (all at once, after stripping tool calls)
+                # Skip this for reasoning models since we already streamed the content
+                if clean_response.strip() and not model_is_reasoning:
+                    final_data = json.dumps({"token": clean_response})
+                    yield f"data: {final_data}\n\n"
                 
                 # Add assistant response to conversation (without tool calls)
                 if clean_response.strip():

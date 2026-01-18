@@ -30,8 +30,11 @@ MODEL_CONTEXT_LIMITS = {
     "claude-3-5-sonnet": 200000,
     "claude-3-5-haiku": 200000,
     # DeepSeek models
-    "deepseek-chat": 64000,
-    "deepseek-reasoner": 64000,
+    # API limits are more conservative than model capabilities
+    "deepseek-chat": 64000,  # DeepSeek Chat API endpoint (input+output)
+    "deepseek-reasoner": 131072,  # DeepSeek R1
+    "deepseek-v3": 64000,  # DeepSeek V3 via API (model supports 128K, API limits to 64K)
+    "deepseek-v2": 64000,
     # Google models
     "gemini-pro": 32768,
     "gemini-1.5-pro": 1000000,
@@ -50,6 +53,22 @@ MODEL_CONTEXT_LIMITS = {
 COMPRESSION_THRESHOLD = 0.80  # Start compressing at 80% usage
 CRITICAL_THRESHOLD = 0.95  # Aggressive compression at 95%
 
+# Reasoning models (output thinking/reasoning content separately from response)
+REASONING_MODEL_PATTERNS = ["reasoner", "r1", "o1", "o3"]
+
+
+def is_reasoning_model(model: str) -> bool:
+    """Check if a model is a reasoning model that streams thinking separately.
+
+    Args:
+        model: Model identifier (e.g., "deepseek/deepseek-reasoner", "ollama/deepseek-r1")
+
+    Returns:
+        bool: True if the model is a reasoning model
+    """
+    model_lower = model.lower()
+    return any(pattern in model_lower for pattern in REASONING_MODEL_PATTERNS)
+
 
 def get_model_context_limit(model: str) -> int:
     """Get the context window limit for a model.
@@ -60,7 +79,24 @@ def get_model_context_limit(model: str) -> int:
     Returns:
         int: Maximum context window size in tokens
     """
-    # Try using LiteLLM's built-in limit detection
+    logger.info("Getting context limit for model", model=model)
+
+    # Extract base model name (handle "provider/model" format)
+    base_model = model.split("/")[-1].lower()
+    model_lower = model.lower()
+    logger.info("Extracted base model name", original=model, base_model=base_model)
+
+    # Check for DeepSeek models specifically first (high priority)
+    # Use our manual config for DeepSeek since LiteLLM's detection is unreliable
+    if "deepseek" in model_lower:
+        if "chat" in base_model or "v3" in base_model or "v2" in base_model:
+            logger.info("Matched DeepSeek Chat model", model=model, limit=MODEL_CONTEXT_LIMITS["deepseek-chat"])
+            return MODEL_CONTEXT_LIMITS["deepseek-chat"]
+        elif "reasoner" in base_model or "r1" in base_model:
+            logger.info("Matched DeepSeek Reasoner model", model=model, limit=MODEL_CONTEXT_LIMITS["deepseek-reasoner"])
+            return MODEL_CONTEXT_LIMITS["deepseek-reasoner"]
+
+    # Try using LiteLLM's built-in limit detection for other models
     try:
         max_tokens = litellm.get_max_tokens(model)
         if max_tokens and max_tokens > 0:
@@ -69,18 +105,19 @@ def get_model_context_limit(model: str) -> int:
     except Exception as e:
         logger.debug("Could not get max tokens from LiteLLM", model=model, error=str(e))
 
-    # Fall back to our configuration
-    # Extract base model name (handle "provider/model" format)
-    base_model = model.split("/")[-1].lower()
+    # Check exact match
+    if base_model in MODEL_CONTEXT_LIMITS:
+        logger.info("Exact match found", model=model, limit=MODEL_CONTEXT_LIMITS[base_model])
+        return MODEL_CONTEXT_LIMITS[base_model]
 
-    # Check exact match first
+    # Check substring match
     for key, limit in MODEL_CONTEXT_LIMITS.items():
-        if key.lower() in base_model or base_model in key.lower():
-            logger.info("Using configured context limit", model=model, limit=limit)
+        if key != "default" and (key.lower() in base_model or base_model in key.lower()):
+            logger.info("Using configured context limit", model=model, matched_key=key, limit=limit)
             return limit
 
     # Default fallback
-    logger.warning("Unknown model, using default limit", model=model, default=MODEL_CONTEXT_LIMITS["default"])
+    logger.warning("Unknown model, using default limit", model=model, base_model=base_model, default=MODEL_CONTEXT_LIMITS["default"])
     return MODEL_CONTEXT_LIMITS["default"]
 
 
@@ -345,6 +382,11 @@ async def check_and_compress_if_needed(
         )
 
         context_info.update(compression_stats)
+
+        # Recalculate usage_ratio after compression with updated current_tokens
+        context_info["usage_ratio"] = round(
+            context_info["current_tokens"] / model_limit, 3
+        ) if model_limit > 0 else 0
 
         return compressed_messages, context_info
 

@@ -36,6 +36,10 @@ export const messages = writable<Array<{
 	role: string;
 	content: string;
 	timestamp: Date;
+	thinking?: {
+		summary: string;
+		fullContent: string;
+	};
 	codeWrites?: Array<{
 		path: string;
 		content: string;
@@ -50,6 +54,14 @@ export const messages = writable<Array<{
 export const chatInput = writable('');
 export const isLoading = writable(false);
 export const currentConversationId = writable<string | null>(null);
+
+// Thinking/Reasoning State (for DeepSeek R1 and similar models)
+export const activeThinking = writable<{
+	content: string;
+	summary: string | null;
+	isActive: boolean;
+	isComplete: boolean;
+} | null>(null);
 
 // Context Window Management
 export const contextInfo = writable<{

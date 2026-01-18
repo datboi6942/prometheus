@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { 
+	import {
 		Cpu, MessageSquare, FileCode, Play, Sparkles,
 		FolderOpen, Plus, ChevronRight, X, Check, AlertCircle, Loader2,
 		Search, GitBranch, RefreshCw, Trash2, FilePlus, FolderPlus, Edit3,
-		ChevronDown, File, Folder
+		ChevronDown, File, Folder, Brain
 	} from 'lucide-svelte';
 	
 	// Import our refactored components
@@ -14,8 +14,10 @@
 	import MemoriesPanel from '$lib/components/panels/MemoriesPanel.svelte';
 	import MCPServersPanel from '$lib/components/panels/MCPServersPanel.svelte';
 	import TerminalPanel from '$lib/components/panels/TerminalPanel.svelte';
+	import GitPanel from '$lib/components/panels/GitPanel.svelte';
 	import DiffViewer from '$lib/components/chat/DiffViewer.svelte';
-	
+	import ThinkingBlock from '$lib/components/chat/ThinkingBlock.svelte';
+
 	// Import stores
 	import {
 		selectedModel, customEndpoint, customApiKey, apiKeys, workspacePath,
@@ -26,7 +28,7 @@
 		messages, chatInput, isLoading, isConnected, abortController,
 		currentOpenFile, editorHasUnsavedChanges, toolExecutions, activeToolCalls,
 		gitStatus, gitBranches, gitCommits, isGitRepo, githubAuthenticated, githubUser,
-		contextInfo
+		contextInfo, activeThinking
 	} from '$lib/stores';
 	
 	// Import API functions
@@ -597,11 +599,159 @@
 			console.error('Error loading tools:', error);
 		}
 	}
-	
+
+	// Slash command handler
+	async function handleSlashCommand(command: string) {
+		const parts = command.split(' ');
+		const cmd = parts[0].toLowerCase();
+		const args = parts.slice(1);
+
+		switch (cmd) {
+			case '/clear':
+				// Clear chat messages
+				$messages = [];
+				$toolExecutions = [];
+				$activeToolCalls = [];
+				activeCodeAnimations.clear();
+				activeDiffAnimations.clear();
+				$contextInfo = null;
+				addLog('Chat cleared');
+				break;
+
+			case '/compact':
+			case '/compress':
+				// Trigger manual compression by sending a special request
+				if ($messages.length === 0) {
+					addLog('No messages to compress');
+					return;
+				}
+				addLog('Compressing conversation...');
+				// Add a system message that will trigger compression on next interaction
+				$messages = [...$messages, {
+					role: 'user',
+					content: '[Compress conversation and continue]',
+					timestamp: new Date()
+				}];
+				// Then immediately send to trigger compression
+				await sendMessageWithCompression();
+				break;
+
+			case '/reset':
+				// Reset entire conversation
+				if (confirm('Reset entire conversation? This will clear all messages and start fresh.')) {
+					$messages = [];
+					$toolExecutions = [];
+					$activeToolCalls = [];
+					activeCodeAnimations.clear();
+					activeDiffAnimations.clear();
+					$contextInfo = null;
+					$currentConversationId = null;
+					addLog('Conversation reset');
+				}
+				break;
+
+			case '/new':
+			case '/newconversation':
+				// Start new conversation
+				await createNewConversation();
+				addLog(`New conversation created: ${$currentConversationId}`);
+				break;
+
+			case '/help':
+				// Show available commands
+				const helpMessage = `**Available Commands:**
+
+**/clear** - Clear chat messages and context
+**/compact** or **/compress** - Compress conversation to save tokens
+**/reset** - Reset entire conversation and start fresh
+**/new** - Start a new conversation
+**/help** - Show this help message
+
+**Tips:**
+- Use Shift+Enter for new lines in messages
+- Enable Verbose Mode in Settings to see tool call details
+- Context auto-compresses when approaching token limits`;
+
+				$messages = [...$messages, {
+					role: 'assistant',
+					content: helpMessage,
+					timestamp: new Date()
+				}];
+				break;
+
+			default:
+				addLog(`Unknown command: ${cmd}. Type /help for available commands.`);
+		}
+	}
+
+	// Helper function for compression command
+	async function sendMessageWithCompression() {
+		if ($messages.length === 0) return;
+
+		$isLoading = true;
+		$abortController = new AbortController();
+
+		try {
+			const response = await streamChat({
+				model: $selectedModel,
+				messages: $messages.map(m => ({ role: m.role, content: m.content, timestamp: m.timestamp })),
+				workspace_path: $workspacePath,
+				api_base: $customEndpoint || undefined
+			}, $abortController.signal);
+
+			const reader = response.body?.getReader();
+			if (!reader) return;
+
+			const decoder = new TextDecoder();
+			let currentResponse = '';
+			$messages = [...$messages, { role: 'assistant', content: '', timestamp: new Date() }];
+
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+
+				const chunk = decoder.decode(value);
+				const lines = chunk.split('\n');
+
+				for (const line of lines) {
+					if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+						try {
+							const data = JSON.parse(line.slice(6));
+
+							if (data.token) {
+								currentResponse += data.token;
+								$messages[$messages.length - 1].content = currentResponse;
+								$messages = [...$messages];
+							}
+
+							if (data.context_info) {
+								$contextInfo = data.context_info;
+								if (data.context_info.compressed) {
+									addLog(`Compressed: saved ${data.context_info.tokens_saved?.toLocaleString()} tokens`);
+								}
+							}
+						} catch (e) {
+							console.error('Error parsing SSE data:', e);
+						}
+					}
+				}
+			}
+		} catch (error: any) {
+			if (error.name === 'AbortError') {
+				console.log('Request aborted');
+			} else {
+				console.error('Error:', error);
+				addLog(`Error: ${error.message}`);
+			}
+		} finally {
+			$isLoading = false;
+		}
+	}
+
 	// Chat (simplified - full implementation kept for now)
 	async function sendMessage() {
 		console.log('sendMessage called, chatInput:', $chatInput, 'workspacePath:', $workspacePath);
-		
+
 		if (!$chatInput.trim()) {
 			console.log('No chat input provided');
 			addLog('Please type a message first');
@@ -611,7 +761,14 @@
 			addLog('Error: Workspace path is required');
 			return;
 		}
-		
+
+		// Handle slash commands
+		if ($chatInput.trim().startsWith('/')) {
+			await handleSlashCommand($chatInput.trim());
+			$chatInput = '';
+			return;
+		}
+
 		const userMessage = $chatInput;
 		$messages = [...$messages, { role: 'user', content: userMessage, timestamp: new Date() }];
 		$chatInput = '';
@@ -744,12 +901,49 @@
 								}
 							}
 
+							// Handle thinking chunks (DeepSeek R1 reasoning)
+							if (data.thinking_chunk) {
+								if (!$activeThinking) {
+									// Start new thinking session
+									$activeThinking = {
+										content: data.thinking_chunk,
+										summary: null,
+										isActive: true,
+										isComplete: false
+									};
+								} else {
+									// Append to existing thinking
+									$activeThinking.content += data.thinking_chunk;
+								}
+								// Trigger reactivity
+								$activeThinking = $activeThinking;
+							}
+
+							// Handle thinking completion
+							if (data.thinking_complete) {
+								if ($activeThinking) {
+									$activeThinking.summary = data.thinking_complete.summary;
+									$activeThinking.isComplete = true;
+									$activeThinking.isActive = false;
+									$activeThinking = $activeThinking;
+
+									// Attach thinking to last assistant message
+									if ($messages.length > 0 && $messages[$messages.length - 1].role === 'assistant') {
+										$messages[$messages.length - 1].thinking = {
+											summary: data.thinking_complete.summary,
+											fullContent: $activeThinking.content
+										};
+										$messages = [...$messages];
+									}
+								}
+							}
+
 							// Handle errors
 							if (data.error) {
 								console.error('Stream error:', data.error);
 								addLog(`Error: ${data.error}`);
 							}
-							
+
 							// Handle OpenAI format (fallback)
 							if (data.choices?.[0]?.delta?.content) {
 								currentResponse += data.choices[0].delta.content;
@@ -771,6 +965,26 @@
 				addLog(`Error: ${error.message}`);
 			}
 		} finally {
+			// If thinking was active but never completed, generate fallback summary
+			if ($activeThinking && $activeThinking.isActive) {
+				const summary = $activeThinking.content.substring(0, 100) +
+							   ($activeThinking.content.length > 100 ? '...' : '');
+				$activeThinking.summary = summary;
+				$activeThinking.isActive = false;
+				$activeThinking.isComplete = true;
+
+				// Attach to message
+				if ($messages.length > 0 && $messages[$messages.length - 1].role === 'assistant') {
+					$messages[$messages.length - 1].thinking = {
+						summary: summary,
+						fullContent: $activeThinking.content
+					};
+					$messages = [...$messages];
+				}
+			}
+
+			// Clear active thinking
+			$activeThinking = null;
 			$isLoading = false;
 			$isConnected = false;
 		}
@@ -1093,11 +1307,8 @@
 			</div>
 			
 		{:else if $activeExplorerTab === 'git'}
-			<!-- Git Panel - Placeholder (extract later) -->
-			<div class="flex-1 p-4">
-				<div class="text-xs text-slate-400">Git integration panel</div>
-				<div class="text-xs text-slate-500 mt-2">Full git panel to be extracted as component</div>
-			</div>
+			<!-- Git Panel -->
+			<GitPanel />
 		{/if}
 	</aside>
 	{/if}
@@ -1203,13 +1414,26 @@
 										<Sparkles class="w-4 h-4 text-white" />
 									</div>
 								{/if}
-								<div class="max-w-2xl {msg.role === 'user' ? 'bg-amber-500/10 border-amber-500/30' : 'bg-slate-800/50 border-slate-700/50'} border rounded-xl p-4">
-									{#if msg.content}
-										<div class="text-sm text-slate-200 leading-relaxed markdown-content">
-											{@html formatMessageContent(msg.content)}
-										</div>
+								<div class="max-w-2xl space-y-2">
+									<!-- Thinking Block (for assistant messages with reasoning) -->
+									{#if msg.thinking && msg.role === 'assistant'}
+										<ThinkingBlock
+											summary={msg.thinking.summary}
+											fullContent={msg.thinking.fullContent}
+											isStreaming={false}
+											isExpanded={false}
+										/>
 									{/if}
-									<div class="text-[10px] text-slate-500 mt-2">{msg.timestamp.toLocaleTimeString()}</div>
+
+									<!-- Message Content -->
+									<div class="{msg.role === 'user' ? 'bg-amber-500/10 border-amber-500/30' : 'bg-slate-800/50 border-slate-700/50'} border rounded-xl p-4">
+										{#if msg.content}
+											<div class="text-sm text-slate-200 leading-relaxed markdown-content">
+												{@html formatMessageContent(msg.content)}
+											</div>
+										{/if}
+										<div class="text-[10px] text-slate-500 mt-2">{msg.timestamp.toLocaleTimeString()}</div>
+									</div>
 								</div>
 								{#if msg.role === 'user'}
 									<div class="w-8 h-8 rounded-lg bg-slate-700 flex items-center justify-center flex-shrink-0">
@@ -1237,18 +1461,37 @@
 									<Loader2 class="w-4 h-4 text-white animate-spin" />
 								</div>
 								<div class="max-w-2xl flex-1 bg-slate-800/50 border border-blue-500/30 rounded-xl p-4">
-									<div class="flex items-center gap-2 mb-2">
+									<div class="flex items-center gap-2">
 										<span class="text-xs font-mono text-blue-400">{toolCall.tool}</span>
 										<span class="text-[10px] px-2 py-0.5 rounded bg-blue-500/20 text-blue-300">
 											Executing...
 										</span>
 									</div>
-									<div class="text-xs text-slate-400 font-mono">
-										{JSON.stringify(toolCall.args, null, 2)}
-									</div>
+									{#if $verboseMode}
+										<div class="text-xs text-slate-400 font-mono mt-2">
+											{JSON.stringify(toolCall.args, null, 2)}
+										</div>
+									{/if}
 								</div>
 							</div>
 						{/each}
+
+						<!-- Active Thinking (in progress) -->
+						{#if $activeThinking && $activeThinking.isActive}
+							<div class="flex gap-3">
+								<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-blue-600 flex items-center justify-center flex-shrink-0 animate-pulse">
+									<Brain class="w-4 h-4 text-white" />
+								</div>
+								<div class="max-w-2xl flex-1">
+									<ThinkingBlock
+										summary={$activeThinking.summary || "Thinking..."}
+										fullContent={$activeThinking.content}
+										isStreaming={true}
+										isExpanded={true}
+									/>
+								</div>
+							</div>
+						{/if}
 
 						<!-- Code Animations -->
 						{#each Array.from(activeCodeAnimations.values()) as animation}
