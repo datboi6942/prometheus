@@ -1217,8 +1217,12 @@
 								>
 									Save
 								</button>
-								<button 
-									on:click={() => $currentOpenFile = null}
+								<button
+									on:click={() => {
+										if ($editorHasUnsavedChanges && !confirm('Discard unsaved changes?')) return;
+										$currentOpenFile = null;
+										$activeView = 'chat';
+									}}
 									class="p-1 hover:bg-slate-700 rounded"
 								>
 									<X class="w-4 h-4 text-slate-400" />
