@@ -14,6 +14,7 @@
 	import MemoriesPanel from '$lib/components/panels/MemoriesPanel.svelte';
 	import MCPServersPanel from '$lib/components/panels/MCPServersPanel.svelte';
 	import TerminalPanel from '$lib/components/panels/TerminalPanel.svelte';
+	import DiffViewer from '$lib/components/chat/DiffViewer.svelte';
 	
 	// Import stores
 	import {
@@ -174,7 +175,42 @@
 			activeCodeAnimations = new Map(activeCodeAnimations); // Create new Map to trigger reactivity
 		}, 100);
 	}
-	
+
+	// Diff animations
+	interface DiffAnimation {
+		path: string;
+		diff: any;
+		language: string;
+		completed: boolean;
+	}
+	let activeDiffAnimations: Map<string, DiffAnimation> = new Map();
+
+	function startDiffAnimation(path: string, diff: any) {
+		const language = getLanguageFromPath(path);
+		const animation: DiffAnimation = {
+			path,
+			diff,
+			language,
+			completed: false
+		};
+
+		activeDiffAnimations.set(path, animation);
+		activeDiffAnimations = new Map(activeDiffAnimations);
+
+		// Mark complete after 1s, remove after 3s total
+		setTimeout(() => {
+			const anim = activeDiffAnimations.get(path);
+			if (anim) {
+				anim.completed = true;
+				activeDiffAnimations = new Map(activeDiffAnimations);
+				setTimeout(() => {
+					activeDiffAnimations.delete(path);
+					activeDiffAnimations = new Map(activeDiffAnimations);
+				}, 2000);
+			}
+		}, 1000);
+	}
+
 	// Debounced save for settings
 	let saveTimeout: any;
 	function debouncedSave(key: string, value: string) {
@@ -662,14 +698,22 @@
 									status: te.success ? 'success' : 'error',
 									timestamp: new Date(),
 									return_code: te.return_code,
-									hint: te.hint
+									hint: te.hint,
+									diff: te.diff
 								}];
 								console.log('Tool executed:', te.tool, te.success ? '✓' : '✗');
 
-								// Trigger code animation for file writes
-								if (te.tool === 'filesystem_write' && te.success && te.content && te.path) {
-									console.log('Starting code animation for:', te.path);
-									startCodeAnimation(te.path, te.content);
+								// Smart animation selection for file writes
+								if (te.tool === 'filesystem_write' && te.success && te.path) {
+									if (te.action === 'created' && te.content) {
+										// New file → code animation (existing behavior)
+										console.log('Starting code animation for:', te.path);
+										startCodeAnimation(te.path, te.content);
+									} else if (te.action === 'modified' && te.diff) {
+										// Modified file → diff viewer (new behavior)
+										console.log('Starting diff animation for:', te.path);
+										startDiffAnimation(te.path, te.diff);
+									}
 								}
 							}
 
@@ -1232,8 +1276,29 @@
 								</div>
 							</div>
 						{/each}
+
+						<!-- Diff Animations -->
+						{#each Array.from(activeDiffAnimations.values()) as animation}
+							<div class="flex gap-3">
+								<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-fuchsia-600 flex items-center justify-center flex-shrink-0">
+									{#if animation.completed}
+										<Check class="w-4 h-4 text-white" />
+									{:else}
+										<FileCode class="w-4 h-4 text-white animate-pulse" />
+									{/if}
+								</div>
+								<div class="flex-1">
+									<DiffViewer
+										path={animation.path}
+										diff={animation.diff}
+										language={animation.language}
+										completed={animation.completed}
+									/>
+								</div>
+							</div>
+						{/each}
 					</div>
-					
+
 					<!-- Context Usage Indicator -->
 					{#if $contextInfo}
 					<div class="border-t border-slate-800/50 bg-slate-900/50 px-4 py-2">

@@ -1,3 +1,4 @@
+import difflib
 import os
 import re
 import shlex
@@ -47,6 +48,95 @@ class MCPTools:
             raise ValueError(f"Path {path} is outside workspace")
         return full_path
 
+    def _generate_diff(
+        self, path: str, old_content: str, new_content: str
+    ) -> dict[str, Any] | None:
+        """Generate structured diff data using difflib.
+
+        Args:
+            path (str): File path for context.
+            old_content (str): Original file content.
+            new_content (str): New file content.
+
+        Returns:
+            dict[str, Any] | None: Structured diff data or None if no changes.
+        """
+        # Skip diff generation for very large files (>10,000 lines)
+        old_lines = old_content.splitlines(keepends=True)
+        new_lines = new_content.splitlines(keepends=True)
+
+        if len(old_lines) > 10000 or len(new_lines) > 10000:
+            return None
+
+        # Generate unified diff
+        diff_lines = list(
+            difflib.unified_diff(
+                old_lines,
+                new_lines,
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+                lineterm="",
+            )
+        )
+
+        if not diff_lines:
+            return None
+
+        # Parse diff into hunks
+        hunks = []
+        current_hunk = None
+        lines_added = 0
+        lines_removed = 0
+
+        for line in diff_lines:
+            # Skip header lines
+            if line.startswith("---") or line.startswith("+++"):
+                continue
+
+            # Hunk header line
+            if line.startswith("@@"):
+                if current_hunk:
+                    hunks.append(current_hunk)
+                current_hunk = {"header": line, "changes": []}
+                continue
+
+            # Content lines
+            if current_hunk is not None:
+                if line.startswith("+"):
+                    current_hunk["changes"].append(
+                        {"type": "added", "line": line[1:]}
+                    )
+                    lines_added += 1
+                elif line.startswith("-"):
+                    current_hunk["changes"].append(
+                        {"type": "removed", "line": line[1:]}
+                    )
+                    lines_removed += 1
+                else:
+                    # Context line (starts with space or is empty)
+                    current_hunk["changes"].append(
+                        {"type": "context", "line": line[1:] if line else ""}
+                    )
+
+        # Add last hunk
+        if current_hunk:
+            hunks.append(current_hunk)
+
+        lines_changed = min(lines_added, lines_removed)
+
+        return {
+            "format": "unified",
+            "old_content": old_content,
+            "new_content": new_content,
+            "unified_diff": "".join(diff_lines),
+            "stats": {
+                "lines_added": lines_added,
+                "lines_removed": lines_removed,
+                "lines_changed": lines_changed,
+            },
+            "hunks": hunks,
+        }
+
     def filesystem_read(self, path: str) -> dict[str, Any]:
         """Read a file from the workspace.
 
@@ -81,23 +171,43 @@ class MCPTools:
             content (str): Content to write.
 
         Returns:
-            dict[str, Any]: Operation result.
+            dict[str, Any]: Operation result with optional diff.
         """
         try:
             full_path = self._validate_path(path)
             file_existed = full_path.exists()
+            old_content = None
+
+            # Read old content if file exists
+            if file_existed:
+                try:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        old_content = f.read()
+                except Exception:
+                    # If read fails, treat as new file
+                    old_content = None
+
             full_path.parent.mkdir(parents=True, exist_ok=True)
 
+            # Write new content
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
-            return {
+            result = {
                 "success": True,
                 "path": path,
                 "size": len(content),
                 "action": "modified" if file_existed else "created",
                 "content": content,  # Include content for frontend animation
             }
+
+            # Generate diff for modified files
+            if file_existed and old_content is not None:
+                diff_data = self._generate_diff(path, old_content, content)
+                if diff_data:
+                    result["diff"] = diff_data
+
+            return result
         except Exception as e:
             return {"error": str(e)}
 
