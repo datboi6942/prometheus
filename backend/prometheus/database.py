@@ -26,6 +26,7 @@ SENSITIVE_KEYS = {
     "google_api_key",
     "litellm_api_key",
     "customApiKey",
+    "github_token",
 }
 
 
@@ -221,12 +222,28 @@ async def init_db() -> None:
             )
         """)
 
+        # Command permissions table (for dynamic command approval)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS command_permissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                command TEXT NOT NULL UNIQUE,
+                approved INTEGER DEFAULT 0,
+                workspace_path TEXT,
+                approved_at TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+
         # Create index for faster memory searches
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_workspace ON memories(workspace_path)
         """)
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories(tags)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_command_permissions_command ON command_permissions(command)
         """)
 
         await db.commit()
@@ -920,5 +937,133 @@ async def delete_mcp_server(name: str) -> bool:
     """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM mcp_servers WHERE name = ?", (name,))
+        await db.commit()
+    return True
+
+
+# Command permissions functions
+async def check_command_permission(command: str, workspace_path: str | None = None) -> dict[str, Any] | None:
+    """Check if a command has been approved.
+
+    Args:
+        command: Command to check (base command, e.g., 'node', 'python').
+        workspace_path: Optional workspace path for workspace-specific permissions.
+
+    Returns:
+        dict or None: Permission record if found, None otherwise.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        
+        # Check for workspace-specific permission first, then global
+        if workspace_path:
+            async with db.execute(
+                "SELECT * FROM command_permissions WHERE command = ? AND (workspace_path = ? OR workspace_path IS NULL) ORDER BY workspace_path DESC LIMIT 1",
+                (command, workspace_path),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return dict(row)
+        
+        # Check global permission
+        async with db.execute(
+            "SELECT * FROM command_permissions WHERE command = ? AND workspace_path IS NULL",
+            (command,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def add_command_permission(
+    command: str,
+    approved: bool,
+    workspace_path: str | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    """Add or update a command permission.
+
+    Args:
+        command: Command to approve/deny.
+        approved: Whether the command is approved.
+        workspace_path: Optional workspace path for workspace-specific permissions.
+        notes: Optional notes about the permission.
+
+    Returns:
+        dict: The created/updated permission.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO command_permissions (command, approved, workspace_path, approved_at, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(command) DO UPDATE SET
+                approved = ?,
+                workspace_path = ?,
+                approved_at = ?,
+                notes = ?
+            """,
+            (command, 1 if approved else 0, workspace_path, now if approved else None, notes, now,
+             1 if approved else 0, workspace_path, now if approved else None, notes),
+        )
+        perm_id = cursor.lastrowid
+        await db.commit()
+
+    return {
+        "id": perm_id,
+        "command": command,
+        "approved": approved,
+        "workspace_path": workspace_path,
+        "approved_at": now if approved else None,
+        "notes": notes,
+        "created_at": now,
+    }
+
+
+async def get_all_command_permissions(workspace_path: str | None = None) -> list[dict[str, Any]]:
+    """Get all command permissions.
+
+    Args:
+        workspace_path: Optional workspace path to filter by.
+
+    Returns:
+        list: List of permission dictionaries.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        
+        if workspace_path:
+            query = "SELECT * FROM command_permissions WHERE workspace_path = ? OR workspace_path IS NULL ORDER BY created_at DESC"
+            params = (workspace_path,)
+        else:
+            query = "SELECT * FROM command_permissions ORDER BY created_at DESC"
+            params = ()
+        
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def delete_command_permission(command: str, workspace_path: str | None = None) -> bool:
+    """Delete a command permission.
+
+    Args:
+        command: Command to delete permission for.
+        workspace_path: Optional workspace path.
+
+    Returns:
+        bool: True if deleted.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        if workspace_path:
+            await db.execute(
+                "DELETE FROM command_permissions WHERE command = ? AND workspace_path = ?",
+                (command, workspace_path),
+            )
+        else:
+            await db.execute(
+                "DELETE FROM command_permissions WHERE command = ? AND workspace_path IS NULL",
+                (command,),
+            )
         await db.commit()
     return True

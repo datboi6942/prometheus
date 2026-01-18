@@ -4,10 +4,10 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from prometheus.config import settings
+from prometheus.config import settings, translate_host_path_to_container
 from prometheus.database import init_db, get_mcp_servers
 from prometheus.mcp.tools import MCPTools
-from prometheus.routers import chat, conversations, files, git, health, mcp
+from prometheus.routers import chat, conversations, files, git, health, mcp, permissions
 from prometheus.services.mcp_loader import load_mcp_server_tools
 from prometheus.services.tool_registry import get_registry
 
@@ -48,6 +48,7 @@ app.include_router(files.router)
 app.include_router(conversations.router)
 app.include_router(git.router)
 app.include_router(mcp.router)
+app.include_router(permissions.router)
 
 
 @app.on_event("startup")
@@ -64,7 +65,15 @@ async def startup_event() -> None:
     # Register fallback filesystem tools (basic functionality)
     def create_fallback_handler(tool_method: str):
         def handler(args: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-            workspace_path = context.get("workspace_path", settings.workspace_path)
+            # Translate host paths to container paths (for Docker)
+            raw_workspace_path = context.get("workspace_path", settings.workspace_path)
+            workspace_path = translate_host_path_to_container(raw_workspace_path)
+            logger.debug(
+                "Tool workspace path",
+                raw_path=raw_workspace_path,
+                translated_path=workspace_path,
+                tool=tool_method,
+            )
             mcp_tools = MCPTools(workspace_path)
             method = getattr(mcp_tools, tool_method)
             return method(**args)

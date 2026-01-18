@@ -96,6 +96,7 @@ class MCPTools:
                 "path": path,
                 "size": len(content),
                 "action": "modified" if file_existed else "created",
+                "content": content,  # Include content for frontend animation
             }
         except Exception as e:
             return {"error": str(e)}
