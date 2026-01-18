@@ -16,7 +16,7 @@ from prometheus.database import (
 from prometheus.mcp.tools import MCPTools
 from prometheus.routers.health import get_model_router
 from prometheus.services.model_router import ModelRouter
-from prometheus.services.context_manager import check_and_compress_if_needed, model_is_reasoning
+from prometheus.services.context_manager import check_and_compress_if_needed, is_reasoning_model
 
 router = APIRouter(prefix="/api/v1")
 logger = structlog.get_logger()
@@ -387,7 +387,7 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
                 tool_calls_found = []
 
                 # Detect if this is a reasoning model (streams thinking separately from content)
-                model_is_reasoning = model_is_reasoning(request.model)
+                model_is_reasoning = is_reasoning_model(request.model)
 
                 logger.info("Starting model stream", iteration=iteration, message_count=len(current_messages), model_is_reasoning=model_is_reasoning)
 
