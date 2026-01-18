@@ -16,6 +16,7 @@ from prometheus.database import (
 from prometheus.mcp.tools import MCPTools
 from prometheus.routers.health import get_model_router
 from prometheus.services.model_router import ModelRouter
+from prometheus.services.context_manager import check_and_compress_if_needed
 
 router = APIRouter(prefix="/api/v1")
 logger = structlog.get_logger()
@@ -344,16 +345,27 @@ Remember: Be helpful, be concise, and don't repeat yourself.""".format(tools_tex
     messages_with_system = [{"role": "system", "content": full_system_prompt}]
     messages_with_system.extend([msg.model_dump() for msg in request.messages])
 
+    # Check context usage and apply compression if needed
+    messages_to_use, context_info = await check_and_compress_if_needed(
+        messages=messages_with_system,
+        model=request.model,
+        auto_compress=True
+    )
+
     async def event_generator():
         """Multi-turn conversation loop that continues until model is done."""
         import structlog
         logger = structlog.get_logger()
-        
-        # Maintain conversation state
-        current_messages = messages_with_system.copy()
+
+        # Send context information to frontend
+        context_data = json.dumps({"context_info": context_info})
+        yield f"data: {context_data}\n\n"
+
+        # Maintain conversation state (use compressed messages)
+        current_messages = messages_to_use.copy()
         max_iterations = 5  # Limit iterations to prevent over-eager behavior
         iteration = 0
-        
+
         try:
             while iteration < max_iterations:
                 iteration += 1

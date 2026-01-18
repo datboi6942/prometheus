@@ -16,15 +16,16 @@
 	import TerminalPanel from '$lib/components/panels/TerminalPanel.svelte';
 	
 	// Import stores
-	import { 
-		selectedModel, customEndpoint, customApiKey, apiKeys, workspacePath, 
+	import {
+		selectedModel, customEndpoint, customApiKey, apiKeys, workspacePath,
 		verboseMode, autoApproveEdits, settingsLoaded, showSettings,
 		conversations, currentConversationId, globalRules, projectRules,
 		memories, mcpServers, availableTools, files, isLoadingFiles,
 		showExplorer, activeExplorerTab, activeView, showTerminalPanel,
 		messages, chatInput, isLoading, isConnected, abortController,
 		currentOpenFile, editorHasUnsavedChanges, toolExecutions,
-		gitStatus, gitBranches, gitCommits, isGitRepo, githubAuthenticated, githubUser
+		gitStatus, gitBranches, gitCommits, isGitRepo, githubAuthenticated, githubUser,
+		contextInfo
 	} from '$lib/stores';
 	
 	// Import API functions
@@ -652,7 +653,28 @@
 								console.log('Permission required:', data.permission_request);
 								// TODO: Show permission dialog
 							}
-							
+
+							// Handle context information
+							if (data.context_info) {
+								$contextInfo = data.context_info;
+								console.log('Context usage:', data.context_info);
+
+								// Log compression events
+								if (data.context_info.compressed) {
+									console.log(
+										`Context compressed: saved ${data.context_info.tokens_saved} tokens ` +
+										`(${data.context_info.compression_ratio}x compression)`
+									);
+								}
+
+								// Warn about high usage
+								if (data.context_info.critical) {
+									console.warn('Context window critically high - aggressive compression applied');
+								} else if (data.context_info.compression_needed) {
+									console.log('Context window approaching limit - compression applied');
+								}
+							}
+
 							// Handle errors
 							if (data.error) {
 								console.error('Stream error:', data.error);
@@ -1167,6 +1189,44 @@
 						{/each}
 					</div>
 					
+					<!-- Context Usage Indicator -->
+					{#if $contextInfo}
+					<div class="border-t border-slate-800/50 bg-slate-900/50 px-4 py-2">
+						<div class="flex items-center justify-between text-xs">
+							<div class="flex items-center gap-2">
+								<span class="text-slate-400">Context Usage:</span>
+								<span class="font-mono {
+									$contextInfo.critical ? 'text-red-400' :
+									$contextInfo.compression_needed ? 'text-amber-400' :
+									'text-emerald-400'
+								}">
+									{$contextInfo.current_tokens.toLocaleString()} / {$contextInfo.max_tokens.toLocaleString()} tokens
+								</span>
+								<span class="text-slate-500">({Math.round($contextInfo.usage_ratio * 100)}%)</span>
+							</div>
+
+							{#if $contextInfo.compressed}
+							<div class="flex items-center gap-1 text-amber-400">
+								<AlertCircle class="w-3 h-3" />
+								<span>Compressed: {$contextInfo.tokens_saved?.toLocaleString()} tokens saved</span>
+							</div>
+							{/if}
+						</div>
+
+						<!-- Progress bar -->
+						<div class="mt-2 h-1 bg-slate-800 rounded-full overflow-hidden">
+							<div
+								class="h-full transition-all duration-300 {
+									$contextInfo.critical ? 'bg-red-500' :
+									$contextInfo.compression_needed ? 'bg-amber-500' :
+									'bg-emerald-500'
+								}"
+								style="width: {Math.min(100, $contextInfo.usage_ratio * 100)}%"
+							></div>
+						</div>
+					</div>
+					{/if}
+
 					<!-- Chat Input -->
 					<div class="border-t border-slate-800/50 bg-slate-900/50 p-4">
 						<div class="flex gap-3">
