@@ -321,6 +321,29 @@ IMPORTANT GUIDELINES:
 4. After each tool result, either make another tool call OR explain the results to the user
 5. Don't repeat tool calls unnecessarily
 
+FILE EDITING BEST PRACTICES:
+CRITICAL: When modifying existing files, ALWAYS use targeted edit tools instead of rewriting entire files:
+
+1. For replacing specific code sections:
+   - ALWAYS use filesystem_read FIRST to see the current file content
+   - Identify the exact lines to modify (line numbers from the read output)
+   - Use filesystem_replace_lines to replace ONLY those specific lines
+   Example: To fix a function, replace just lines 45-60 instead of rewriting the whole file
+
+2. For simple text replacements:
+   - Use filesystem_search_replace to find and replace specific text
+   - This is perfect for renaming variables, fixing typos, or updating values
+
+3. For adding new code:
+   - Use filesystem_insert to add code at a specific line number
+   - Perfect for adding imports, new functions, or config entries
+
+4. Only use filesystem_write when:
+   - Creating brand new files
+   - The file needs complete restructuring (very rare)
+
+Why this matters: Targeted edits are faster, clearer, and less error-prone than rewriting entire files.
+
 EXAMPLE FLOW:
 User: "List the files"
 You: I'll list the files for you.
@@ -338,6 +361,21 @@ You: {{"tool": "filesystem_delete", "args": {{"path": "file1.txt"}}}}
 You: {{"tool": "filesystem_delete", "args": {{"path": "file2.txt"}}}}
 [You receive results]
 You: I've successfully deleted both .txt files.
+
+EXAMPLE FILE EDITING FLOW (CORRECT):
+User: "Fix the bug in calculate_total function in utils.py"
+You: Let me read the file first to see the current implementation.
+{{"tool": "filesystem_read", "args": {{"path": "utils.py"}}}}
+[You receive file content with line numbers showing the bug is in lines 42-45]
+You: I found the issue - the function is missing a return statement. I'll fix lines 42-45.
+{{"tool": "filesystem_replace_lines", "args": {{"path": "utils.py", "start_line": 42, "end_line": 45, "replacement": "    total = sum(items)\\n    return total"}}}}
+[You receive success with diff showing the change]
+You: Fixed! The calculate_total function now properly returns the total value.
+
+WRONG APPROACH (DON'T DO THIS):
+User: "Fix the bug in calculate_total function"
+You: {{"tool": "filesystem_write", "args": {{"path": "utils.py", "content": "[entire 300-line file contents with one line changed]"}}}}
+^^ This rewrites the ENTIRE file when only 2 lines needed changing!
 
 Remember: Be helpful, be concise, and continue making tool calls until the task is complete.""".format(tools_text=tools_text)
 

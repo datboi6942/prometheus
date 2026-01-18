@@ -208,6 +208,178 @@ class MCPTools:
         except Exception as e:
             return {"error": str(e)}
 
+    def filesystem_replace_lines(
+        self, path: str, start_line: int, end_line: int, replacement: str
+    ) -> dict[str, Any]:
+        """Replace a specific range of lines in a file.
+
+        Args:
+            path (str): Relative path within workspace.
+            start_line (int): Starting line number (1-indexed).
+            end_line (int): Ending line number (1-indexed, inclusive).
+            replacement (str): New content to replace the line range.
+
+        Returns:
+            dict[str, Any]: Operation result with diff.
+        """
+        try:
+            full_path = self._validate_path(path)
+
+            if not full_path.exists():
+                return {"error": f"File not found: {path}"}
+
+            # Read existing content
+            with open(full_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            old_content = "".join(lines)
+
+            # Validate line numbers
+            if start_line < 1 or end_line < start_line or start_line > len(lines):
+                return {
+                    "error": f"Invalid line range: {start_line}-{end_line} (file has {len(lines)} lines)"
+                }
+
+            # Perform replacement
+            end_line = min(end_line, len(lines))
+            new_lines = (
+                lines[: start_line - 1]
+                + [replacement if replacement.endswith("\n") else replacement + "\n"]
+                + lines[end_line:]
+            )
+            new_content = "".join(new_lines)
+
+            # Write modified content
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+
+            result = {
+                "success": True,
+                "path": path,
+                "action": "modified",
+                "lines_replaced": f"{start_line}-{end_line}",
+            }
+
+            # Generate diff
+            diff_data = self._generate_diff(path, old_content, new_content)
+            if diff_data:
+                result["diff"] = diff_data
+
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def filesystem_search_replace(
+        self, path: str, search: str, replace: str, count: int = -1
+    ) -> dict[str, Any]:
+        """Search and replace text in a file.
+
+        Args:
+            path (str): Relative path within workspace.
+            search (str): Text to search for (exact match).
+            replace (str): Text to replace with.
+            count (int): Maximum number of replacements (-1 for all).
+
+        Returns:
+            dict[str, Any]: Operation result with diff.
+        """
+        try:
+            full_path = self._validate_path(path)
+
+            if not full_path.exists():
+                return {"error": f"File not found: {path}"}
+
+            # Read existing content
+            with open(full_path, "r", encoding="utf-8") as f:
+                old_content = f.read()
+
+            # Check if search text exists
+            if search not in old_content:
+                return {
+                    "success": False,
+                    "error": f"Search text not found in file: {search[:50]}...",
+                }
+
+            # Perform replacement
+            new_content = old_content.replace(search, replace, count)
+            num_replacements = old_content.count(search) if count == -1 else min(count, old_content.count(search))
+
+            # Write modified content
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+
+            result = {
+                "success": True,
+                "path": path,
+                "action": "modified",
+                "replacements": num_replacements,
+            }
+
+            # Generate diff
+            diff_data = self._generate_diff(path, old_content, new_content)
+            if diff_data:
+                result["diff"] = diff_data
+
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def filesystem_insert(
+        self, path: str, line_number: int, content: str
+    ) -> dict[str, Any]:
+        """Insert content at a specific line in a file.
+
+        Args:
+            path (str): Relative path within workspace.
+            line_number (int): Line number to insert at (1-indexed, inserts before this line).
+            content (str): Content to insert.
+
+        Returns:
+            dict[str, Any]: Operation result with diff.
+        """
+        try:
+            full_path = self._validate_path(path)
+
+            if not full_path.exists():
+                return {"error": f"File not found: {path}"}
+
+            # Read existing content
+            with open(full_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            old_content = "".join(lines)
+
+            # Validate line number
+            if line_number < 1 or line_number > len(lines) + 1:
+                return {
+                    "error": f"Invalid line number: {line_number} (file has {len(lines)} lines)"
+                }
+
+            # Insert content
+            content_with_newline = content if content.endswith("\n") else content + "\n"
+            new_lines = lines[: line_number - 1] + [content_with_newline] + lines[line_number - 1 :]
+            new_content = "".join(new_lines)
+
+            # Write modified content
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+
+            result = {
+                "success": True,
+                "path": path,
+                "action": "modified",
+                "inserted_at": line_number,
+            }
+
+            # Generate diff
+            diff_data = self._generate_diff(path, old_content, new_content)
+            if diff_data:
+                result["diff"] = diff_data
+
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
     def filesystem_list(self, path: str = "") -> dict[str, Any]:
         """List contents of a directory in the workspace.
 

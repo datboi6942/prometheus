@@ -684,6 +684,59 @@
 		}
 	}
 
+	// Auto-scroll chat messages
+	let chatMessagesContainer: HTMLElement;
+
+	function scrollToBottom(behavior: ScrollBehavior = 'smooth') {
+		if (chatMessagesContainer) {
+			setTimeout(() => {
+				chatMessagesContainer.scrollTo({
+					top: chatMessagesContainer.scrollHeight,
+					behavior
+				});
+			}, 10);
+		}
+	}
+
+	// Auto-scroll when messages or tool calls change
+	$: if ($messages || $activeToolCalls) {
+		scrollToBottom();
+	}
+
+	// Tool call timeout mechanism - remove stuck tool calls after 30 seconds
+	let toolCallTimeouts: Map<string, number> = new Map();
+
+	function addToolCallTimeout(toolCall: any) {
+		const key = `${toolCall.tool}_${JSON.stringify(toolCall.args)}`;
+		const timeoutId = setTimeout(() => {
+			// Remove stuck tool call after 30 seconds
+			const matchIndex = $activeToolCalls.findIndex(tc =>
+				tc.tool === toolCall.tool &&
+				JSON.stringify(tc.args) === JSON.stringify(toolCall.args)
+			);
+			if (matchIndex !== -1) {
+				console.warn(`Tool call timed out: ${toolCall.tool}`);
+				$activeToolCalls = [
+					...$activeToolCalls.slice(0, matchIndex),
+					...$activeToolCalls.slice(matchIndex + 1)
+				];
+				addLog(`Tool call timed out: ${toolCall.tool}`);
+			}
+			toolCallTimeouts.delete(key);
+		}, 30000); // 30 second timeout
+
+		toolCallTimeouts.set(key, timeoutId);
+	}
+
+	function clearToolCallTimeout(toolCall: any) {
+		const key = `${toolCall.tool}_${JSON.stringify(toolCall.args)}`;
+		const timeoutId = toolCallTimeouts.get(key);
+		if (timeoutId) {
+			clearTimeout(timeoutId);
+			toolCallTimeouts.delete(key);
+		}
+	}
+
 	// Helper function for compression command
 	async function sendMessageWithCompression() {
 		if ($messages.length === 0) return;
@@ -822,11 +875,13 @@
 							// Handle tool call notifications (tool is being called, not yet executed)
 							if (data.tool_call) {
 								console.log('Tool call initiated:', data.tool_call.tool);
-								$activeToolCalls = [...$activeToolCalls, {
+								const toolCall = {
 									tool: data.tool_call.tool,
 									args: data.tool_call.args,
 									timestamp: new Date()
-								}];
+								};
+								$activeToolCalls = [...$activeToolCalls, toolCall];
+								addToolCallTimeout(toolCall);
 							}
 
 							// Handle tool execution notifications (tool execution completed)
@@ -839,6 +894,8 @@
 									JSON.stringify(tc.args) === JSON.stringify(te.args || {})
 								);
 								if (matchIndex !== -1) {
+									const completedToolCall = $activeToolCalls[matchIndex];
+									clearToolCallTimeout(completedToolCall);
 									$activeToolCalls = [
 										...$activeToolCalls.slice(0, matchIndex),
 										...$activeToolCalls.slice(matchIndex + 1)
@@ -1406,7 +1463,7 @@
 			{#if $activeView === 'chat'}
 				<!-- Chat View -->
 				<div class="flex-1 flex flex-col">
-					<div class="flex-1 overflow-y-auto p-6 space-y-4">
+					<div bind:this={chatMessagesContainer} class="flex-1 overflow-y-auto p-6 space-y-4">
 						{#each $messages as msg}
 							<div class="flex gap-3 {msg.role === 'user' ? 'justify-end' : 'justify-start'}">
 								{#if msg.role !== 'user'}

@@ -82,7 +82,10 @@ async def startup_event() -> None:
     # Register basic filesystem tools as fallbacks
     fallback_tools = {
         "filesystem_read": ("Read a file from the workspace", {"path": {"type": "string"}}),
-        "filesystem_write": ("Write content to a file", {"path": {"type": "string"}, "content": {"type": "string"}}),
+        "filesystem_write": ("Write content to a file (creates new or replaces entire file)", {"path": {"type": "string"}, "content": {"type": "string"}}),
+        "filesystem_replace_lines": ("Replace specific line range in a file", {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}, "replacement": {"type": "string"}}),
+        "filesystem_search_replace": ("Search and replace text in a file", {"path": {"type": "string"}, "search": {"type": "string"}, "replace": {"type": "string"}, "count": {"type": "integer", "default": -1}}),
+        "filesystem_insert": ("Insert content at a specific line in a file", {"path": {"type": "string"}, "line_number": {"type": "integer"}, "content": {"type": "string"}}),
         "filesystem_list": ("List directory contents", {"path": {"type": "string", "default": ""}}),
         "filesystem_delete": ("Delete a file or directory", {"path": {"type": "string"}}),
     }
