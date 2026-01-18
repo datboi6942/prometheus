@@ -88,6 +88,54 @@ class CreateRepoRequest(BaseModel):
     auto_init: bool = False
 
 
+class CreatePRRequest(BaseModel):
+    """Request model for creating a pull request."""
+
+    repo_full_name: str
+    title: str
+    head: str
+    base: str
+    body: str = ""
+    draft: bool = False
+
+
+class MergePRRequest(BaseModel):
+    """Request model for merging a pull request."""
+
+    repo_full_name: str
+    pr_number: int
+    commit_message: str = ""
+    merge_method: str = "merge"
+
+
+class PRCommentRequest(BaseModel):
+    """Request model for adding a PR comment."""
+
+    repo_full_name: str
+    pr_number: int
+    body: str
+
+
+class CreateIssueRequest(BaseModel):
+    """Request model for creating an issue."""
+
+    repo_full_name: str
+    title: str
+    body: str = ""
+    labels: list[str] = []
+
+
+class UpdateIssueRequest(BaseModel):
+    """Request model for updating an issue."""
+
+    repo_full_name: str
+    issue_number: int
+    title: str | None = None
+    body: str | None = None
+    state: str | None = None
+    labels: list[str] | None = None
+
+
 def get_git_service(workspace_path: str | None = None) -> GitService:
     """Dependency to get Git service instance.
 
@@ -573,4 +621,271 @@ async def create_github_repo(
     )
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to create repository"))
+    return result
+
+
+# Pull Request endpoints
+@router.get("/github/pulls")
+async def get_pull_requests(
+    repo_full_name: str = Query(...),
+    state: str = Query("open"),
+    limit: int = Query(30),
+    github_service: Annotated[GitHubService, Depends(get_github_service)] = None,
+) -> dict[str, Any]:
+    """Get pull requests for a repository.
+
+    Args:
+        repo_full_name: Repository full name (owner/repo).
+        state: PR state (open, closed, all).
+        limit: Maximum number of PRs.
+        github_service: Injected GitHub service.
+
+    Returns:
+        dict: List of pull requests.
+    """
+    result = github_service.get_pull_requests(repo_full_name, state, limit)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to get pull requests"))
+    return result
+
+
+@router.get("/github/pulls/{pr_number}")
+async def get_pull_request(
+    repo_full_name: str = Query(...),
+    pr_number: int = ...,
+    github_service: Annotated[GitHubService, Depends(get_github_service)] = None,
+) -> dict[str, Any]:
+    """Get a specific pull request.
+
+    Args:
+        repo_full_name: Repository full name (owner/repo).
+        pr_number: Pull request number.
+        github_service: Injected GitHub service.
+
+    Returns:
+        dict: Pull request details.
+    """
+    result = github_service.get_pull_request(repo_full_name, pr_number)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to get pull request"))
+    return result
+
+
+@router.post("/github/pulls")
+async def create_pull_request(
+    request: CreatePRRequest,
+    github_service: Annotated[GitHubService, Depends(get_github_service)],
+) -> dict[str, Any]:
+    """Create a pull request.
+
+    Args:
+        request: PR details.
+        github_service: Injected GitHub service.
+
+    Returns:
+        dict: Created pull request information.
+    """
+    result = github_service.create_pull_request(
+        repo_full_name=request.repo_full_name,
+        title=request.title,
+        head=request.head,
+        base=request.base,
+        body=request.body,
+        draft=request.draft,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to create pull request"))
+    return result
+
+
+@router.post("/github/pulls/merge")
+async def merge_pull_request(
+    request: MergePRRequest,
+    github_service: Annotated[GitHubService, Depends(get_github_service)],
+) -> dict[str, Any]:
+    """Merge a pull request.
+
+    Args:
+        request: Merge details.
+        github_service: Injected GitHub service.
+
+    Returns:
+        dict: Merge result.
+    """
+    result = github_service.merge_pull_request(
+        repo_full_name=request.repo_full_name,
+        pr_number=request.pr_number,
+        commit_message=request.commit_message,
+        merge_method=request.merge_method,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to merge pull request"))
+    return result
+
+
+@router.get("/github/pulls/{pr_number}/comments")
+async def get_pr_comments(
+    repo_full_name: str = Query(...),
+    pr_number: int = ...,
+    github_service: Annotated[GitHubService, Depends(get_github_service)] = None,
+) -> dict[str, Any]:
+    """Get comments on a pull request.
+
+    Args:
+        repo_full_name: Repository full name (owner/repo).
+        pr_number: Pull request number.
+        github_service: Injected GitHub service.
+
+    Returns:
+        dict: List of comments.
+    """
+    result = github_service.get_pr_comments(repo_full_name, pr_number)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to get PR comments"))
+    return result
+
+
+@router.post("/github/pulls/comments")
+async def add_pr_comment(
+    request: PRCommentRequest,
+    github_service: Annotated[GitHubService, Depends(get_github_service)],
+) -> dict[str, Any]:
+    """Add a comment to a pull request.
+
+    Args:
+        request: Comment details.
+        github_service: Injected GitHub service.
+
+    Returns:
+        dict: Created comment information.
+    """
+    result = github_service.add_pr_comment(
+        repo_full_name=request.repo_full_name,
+        pr_number=request.pr_number,
+        body=request.body,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to add PR comment"))
+    return result
+
+
+# Issue endpoints
+@router.get("/github/issues")
+async def get_issues(
+    repo_full_name: str = Query(...),
+    state: str = Query("open"),
+    limit: int = Query(30),
+    github_service: Annotated[GitHubService, Depends(get_github_service)] = None,
+) -> dict[str, Any]:
+    """Get issues for a repository.
+
+    Args:
+        repo_full_name: Repository full name (owner/repo).
+        state: Issue state (open, closed, all).
+        limit: Maximum number of issues.
+        github_service: Injected GitHub service.
+
+    Returns:
+        dict: List of issues.
+    """
+    result = github_service.get_issues(repo_full_name, state, limit)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to get issues"))
+    return result
+
+
+@router.post("/github/issues")
+async def create_issue(
+    request: CreateIssueRequest,
+    github_service: Annotated[GitHubService, Depends(get_github_service)],
+) -> dict[str, Any]:
+    """Create an issue.
+
+    Args:
+        request: Issue details.
+        github_service: Injected GitHub service.
+
+    Returns:
+        dict: Created issue information.
+    """
+    result = github_service.create_issue(
+        repo_full_name=request.repo_full_name,
+        title=request.title,
+        body=request.body,
+        labels=request.labels if request.labels else None,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to create issue"))
+    return result
+
+
+@router.patch("/github/issues")
+async def update_issue(
+    request: UpdateIssueRequest,
+    github_service: Annotated[GitHubService, Depends(get_github_service)],
+) -> dict[str, Any]:
+    """Update an issue.
+
+    Args:
+        request: Issue update details.
+        github_service: Injected GitHub service.
+
+    Returns:
+        dict: Updated issue information.
+    """
+    result = github_service.update_issue(
+        repo_full_name=request.repo_full_name,
+        issue_number=request.issue_number,
+        title=request.title,
+        body=request.body,
+        state=request.state,
+        labels=request.labels,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to update issue"))
+    return result
+
+
+# Workflow endpoints
+@router.get("/github/workflows")
+async def get_workflows(
+    repo_full_name: str = Query(...),
+    github_service: Annotated[GitHubService, Depends(get_github_service)] = None,
+) -> dict[str, Any]:
+    """Get workflows for a repository.
+
+    Args:
+        repo_full_name: Repository full name (owner/repo).
+        github_service: Injected GitHub service.
+
+    Returns:
+        dict: List of workflows.
+    """
+    result = github_service.get_workflows(repo_full_name)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to get workflows"))
+    return result
+
+
+@router.get("/github/workflows/runs")
+async def get_workflow_runs(
+    repo_full_name: str = Query(...),
+    workflow_id: int | None = Query(None),
+    limit: int = Query(30),
+    github_service: Annotated[GitHubService, Depends(get_github_service)] = None,
+) -> dict[str, Any]:
+    """Get workflow runs for a repository.
+
+    Args:
+        repo_full_name: Repository full name (owner/repo).
+        workflow_id: Optional workflow ID to filter by.
+        limit: Maximum number of runs.
+        github_service: Injected GitHub service.
+
+    Returns:
+        dict: List of workflow runs.
+    """
+    result = github_service.get_workflow_runs(repo_full_name, workflow_id, limit)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to get workflow runs"))
     return result

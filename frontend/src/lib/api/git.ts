@@ -194,6 +194,15 @@ export async function addRemote(
 }
 
 /**
+ * Get GitHub repositories
+ */
+export async function getGitHubRepos(): Promise<any> {
+	const response = await fetch(`${BASE_URL}/git/github/repos`);
+	if (!response.ok) throw new Error('Failed to get GitHub repositories');
+	return await response.json();
+}
+
+/**
  * Create GitHub repository
  */
 export async function createGitHubRepo(
@@ -211,5 +220,209 @@ export async function createGitHubRepo(
 		})
 	});
 	if (!response.ok) throw new Error('Failed to create GitHub repository');
+	return await response.json();
+}
+
+// Pull Request functions
+/**
+ * Get pull requests for a repository
+ */
+export async function getPullRequests(
+	repoFullName: string,
+	state: string = 'open',
+	limit: number = 30
+): Promise<any> {
+	const response = await fetch(
+		`${BASE_URL}/git/github/pulls?repo_full_name=${encodeURIComponent(repoFullName)}&state=${state}&limit=${limit}`
+	);
+	if (!response.ok) throw new Error('Failed to get pull requests');
+	return await response.json();
+}
+
+/**
+ * Get a specific pull request
+ */
+export async function getPullRequest(repoFullName: string, prNumber: number): Promise<any> {
+	const response = await fetch(
+		`${BASE_URL}/git/github/pulls/${prNumber}?repo_full_name=${encodeURIComponent(repoFullName)}`
+	);
+	if (!response.ok) throw new Error('Failed to get pull request');
+	return await response.json();
+}
+
+/**
+ * Create a pull request
+ */
+export async function createPullRequest(
+	repoFullName: string,
+	title: string,
+	head: string,
+	base: string,
+	body: string = '',
+	draft: boolean = false
+): Promise<any> {
+	const response = await fetch(`${BASE_URL}/git/github/pulls`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			repo_full_name: repoFullName,
+			title,
+			head,
+			base,
+			body,
+			draft
+		})
+	});
+	if (!response.ok) throw new Error('Failed to create pull request');
+	return await response.json();
+}
+
+/**
+ * Merge a pull request
+ */
+export async function mergePullRequest(
+	repoFullName: string,
+	prNumber: number,
+	commitMessage: string = '',
+	mergeMethod: string = 'merge'
+): Promise<any> {
+	const response = await fetch(`${BASE_URL}/git/github/pulls/merge`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			repo_full_name: repoFullName,
+			pr_number: prNumber,
+			commit_message: commitMessage,
+			merge_method: mergeMethod
+		})
+	});
+	if (!response.ok) throw new Error('Failed to merge pull request');
+	return await response.json();
+}
+
+/**
+ * Get comments on a pull request
+ */
+export async function getPRComments(repoFullName: string, prNumber: number): Promise<any> {
+	const response = await fetch(
+		`${BASE_URL}/git/github/pulls/${prNumber}/comments?repo_full_name=${encodeURIComponent(repoFullName)}`
+	);
+	if (!response.ok) throw new Error('Failed to get PR comments');
+	return await response.json();
+}
+
+/**
+ * Add a comment to a pull request
+ */
+export async function addPRComment(
+	repoFullName: string,
+	prNumber: number,
+	body: string
+): Promise<any> {
+	const response = await fetch(`${BASE_URL}/git/github/pulls/comments`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			repo_full_name: repoFullName,
+			pr_number: prNumber,
+			body
+		})
+	});
+	if (!response.ok) throw new Error('Failed to add PR comment');
+	return await response.json();
+}
+
+// Issue functions
+/**
+ * Get issues for a repository
+ */
+export async function getIssues(
+	repoFullName: string,
+	state: string = 'open',
+	limit: number = 30
+): Promise<any> {
+	const response = await fetch(
+		`${BASE_URL}/git/github/issues?repo_full_name=${encodeURIComponent(repoFullName)}&state=${state}&limit=${limit}`
+	);
+	if (!response.ok) throw new Error('Failed to get issues');
+	return await response.json();
+}
+
+/**
+ * Create an issue
+ */
+export async function createIssue(
+	repoFullName: string,
+	title: string,
+	body: string = '',
+	labels: string[] = []
+): Promise<any> {
+	const response = await fetch(`${BASE_URL}/git/github/issues`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			repo_full_name: repoFullName,
+			title,
+			body,
+			labels
+		})
+	});
+	if (!response.ok) throw new Error('Failed to create issue');
+	return await response.json();
+}
+
+/**
+ * Update an issue
+ */
+export async function updateIssue(
+	repoFullName: string,
+	issueNumber: number,
+	title?: string,
+	body?: string,
+	state?: string,
+	labels?: string[]
+): Promise<any> {
+	const response = await fetch(`${BASE_URL}/git/github/issues`, {
+		method: 'PATCH',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({
+			repo_full_name: repoFullName,
+			issue_number: issueNumber,
+			title,
+			body,
+			state,
+			labels
+		})
+	});
+	if (!response.ok) throw new Error('Failed to update issue');
+	return await response.json();
+}
+
+// Workflow functions
+/**
+ * Get workflows for a repository
+ */
+export async function getWorkflows(repoFullName: string): Promise<any> {
+	const response = await fetch(
+		`${BASE_URL}/git/github/workflows?repo_full_name=${encodeURIComponent(repoFullName)}`
+	);
+	if (!response.ok) throw new Error('Failed to get workflows');
+	return await response.json();
+}
+
+/**
+ * Get workflow runs for a repository
+ */
+export async function getWorkflowRuns(
+	repoFullName: string,
+	workflowId?: number,
+	limit: number = 30
+): Promise<any> {
+	let url = `${BASE_URL}/git/github/workflows/runs?repo_full_name=${encodeURIComponent(repoFullName)}&limit=${limit}`;
+	if (workflowId) {
+		url += `&workflow_id=${workflowId}`;
+	}
+	const response = await fetch(url);
+	if (!response.ok) throw new Error('Failed to get workflow runs');
 	return await response.json();
 }

@@ -14,6 +14,7 @@
 	import MemoriesPanel from '$lib/components/panels/MemoriesPanel.svelte';
 	import MCPServersPanel from '$lib/components/panels/MCPServersPanel.svelte';
 	import TerminalPanel from '$lib/components/panels/TerminalPanel.svelte';
+	import GitPanel from '$lib/components/panels/GitPanel.svelte';
 	import DiffViewer from '$lib/components/chat/DiffViewer.svelte';
 	
 	// Import stores
@@ -1093,11 +1094,8 @@
 			</div>
 			
 		{:else if $activeExplorerTab === 'git'}
-			<!-- Git Panel - Placeholder (extract later) -->
-			<div class="flex-1 p-4">
-				<div class="text-xs text-slate-400">Git integration panel</div>
-				<div class="text-xs text-slate-500 mt-2">Full git panel to be extracted as component</div>
-			</div>
+			<!-- Git Panel -->
+			<GitPanel />
 		{/if}
 	</aside>
 	{/if}
