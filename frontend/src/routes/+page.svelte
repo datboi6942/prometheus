@@ -131,7 +131,7 @@
 		};
 
 		activeCodeAnimations.set(path, animation);
-		activeCodeAnimations = activeCodeAnimations;
+		activeCodeAnimations = new Map(activeCodeAnimations); // Create new Map to trigger reactivity
 
 		// Animate character by character at ~50 chars/sec for smooth effect
 		const charsPerFrame = 5;
@@ -163,14 +163,14 @@
 				// Remove animation from active list after 1 second (gives time to see completion)
 				setTimeout(() => {
 					activeCodeAnimations.delete(path);
-					activeCodeAnimations = activeCodeAnimations;
+					activeCodeAnimations = new Map(activeCodeAnimations); // Create new Map to trigger reactivity
 				}, 1000);
 			} else {
 				anim.displayedContent += anim.fullContent.slice(anim.currentIndex, anim.currentIndex + charsPerFrame);
 				anim.currentIndex += charsPerFrame;
 			}
 
-			activeCodeAnimations = activeCodeAnimations;
+			activeCodeAnimations = new Map(activeCodeAnimations); // Create new Map to trigger reactivity
 		}, 100);
 	}
 	
