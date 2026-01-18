@@ -292,7 +292,7 @@
 				class="p-1.5 hover:bg-slate-700 rounded transition-colors disabled:opacity-50"
 				title="Refresh"
 			>
-				<RefreshCw class="w-3.5 h-3.5" class:animate-spin={loading} />
+				<RefreshCw class="w-3.5 h-3.5 {loading ? 'animate-spin' : ''}" />
 			</button>
 		</div>
 	</div>
