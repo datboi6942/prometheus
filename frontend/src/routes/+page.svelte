@@ -640,8 +640,17 @@
 							if (data.tool_execution) {
 								const te = data.tool_execution;
 
-								// Remove from active tool calls
-								$activeToolCalls = $activeToolCalls.filter(tc => tc.tool !== te.tool);
+								// Remove first matching tool call (FIFO execution order)
+								const matchIndex = $activeToolCalls.findIndex(tc =>
+									tc.tool === te.tool &&
+									JSON.stringify(tc.args) === JSON.stringify(te.args || {})
+								);
+								if (matchIndex !== -1) {
+									$activeToolCalls = [
+										...$activeToolCalls.slice(0, matchIndex),
+										...$activeToolCalls.slice(matchIndex + 1)
+									];
+								}
 
 								// Add to tool executions history
 								$toolExecutions = [...$toolExecutions, {
