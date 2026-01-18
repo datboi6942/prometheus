@@ -126,9 +126,6 @@ class MCPTools:
 
         return {
             "format": "unified",
-            "old_content": old_content,
-            "new_content": new_content,
-            "unified_diff": "".join(diff_lines),
             "stats": {
                 "lines_added": lines_added,
                 "lines_removed": lines_removed,
