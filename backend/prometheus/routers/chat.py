@@ -2,11 +2,12 @@ import json
 import re
 from typing import Annotated
 
+import structlog
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from prometheus.config import settings
+from prometheus.config import settings, translate_host_path_to_container
 from prometheus.database import (
     add_memory,
     get_enabled_rules_text,
@@ -17,6 +18,7 @@ from prometheus.routers.health import get_model_router
 from prometheus.services.model_router import ModelRouter
 
 router = APIRouter(prefix="/api/v1")
+logger = structlog.get_logger()
 
 
 class ChatMessage(BaseModel):
@@ -38,7 +40,9 @@ class WorkspaceConfig(BaseModel):
 
 def get_mcp_tools(workspace: str | None = None) -> MCPTools:
     """Dependency to get MCP tools instance."""
-    path = workspace or settings.workspace_path
+    raw_path = workspace or settings.workspace_path
+    # Translate host paths to container paths (for Docker)
+    path = translate_host_path_to_container(raw_path)
     return MCPTools(path)
 
 
@@ -244,6 +248,40 @@ async def chat_stream(
     """Server-Sent Events endpoint for streaming with tool execution."""
     mcp_tools = get_mcp_tools(request.workspace_path)
 
+    # Get API key from database based on model provider
+    from prometheus.database import get_setting
+    
+    api_key_to_use = request.api_key
+    
+    # If no API key provided in request, try to get it from database
+    if not api_key_to_use and request.model:
+        model_provider = request.model.split('/')[0].lower()
+        
+        # Map model providers to their database keys
+        provider_key_map = {
+            'openai': 'openai_api_key',
+            'anthropic': 'anthropic_api_key',
+            'deepseek': 'deepseek_api_key',
+            'grok': 'grok_api_key',
+            'xai': 'grok_api_key',  # xAI also uses grok key
+            'google': 'google_api_key',
+            'gemini': 'google_api_key',
+            'litellm': 'litellm_api_key',
+        }
+        
+        key_name = provider_key_map.get(model_provider, f'{model_provider}_api_key')
+        stored_key = await get_setting(key_name)
+        
+        if stored_key:
+            api_key_to_use = stored_key
+            logger.info("Using API key from database", provider=model_provider)
+        else:
+            # Fallback to legacy apiKey for backward compatibility
+            legacy_key = await get_setting('apiKey')
+            if legacy_key:
+                api_key_to_use = legacy_key
+                logger.info("Using legacy API key from database")
+
     # Get available tools dynamically from registry
     from prometheus.services.tool_registry import get_registry
     
@@ -263,52 +301,32 @@ async def chat_stream(
     
     tools_text = "\n".join(tools_list) if tools_list else "No tools available"
 
-    # Enhanced system prompt for autonomous coding
-    system_prompt = f"""You are Prometheus, an autonomous AI coding agent. You have tools to create, read, modify, and TEST files.
+    # System prompt - kept simple and clear
+    system_prompt = """You are Prometheus, a helpful AI coding assistant with access to tools.
 
-TOOLS AVAILABLE:
+AVAILABLE TOOLS:
 {tools_text}
 
-TOOL FORMAT - Use this exact JSON format:
-{"tool": "TOOL_NAME", "args": {"param": "value"}}
+HOW TO USE TOOLS:
+When you need to use a tool, output this JSON format:
+{{"tool": "TOOL_NAME", "args": {{"param": "value"}}}}
 
-CRITICAL RULES:
-1. When asked to CREATE code - use filesystem_write IMMEDIATELY
-2. When asked to TEST/RUN Python - use run_python with stdin_input for interactive scripts
-3. When asked to READ/SHOW code - use filesystem_read
-4. Do NOT ask permission - just do it
-5. Write complete, working code - not pseudocode
-6. After the tool JSON, briefly explain what you created/did
-7. For interactive programs, provide test input via stdin_input parameter
+After you use a tool, you will receive the results. Then you can explain what happened to the user.
 
-TESTING EXAMPLES:
+IMPORTANT GUIDELINES:
+1. For greetings or simple questions - just respond, no tools needed
+2. Only use ONE tool at a time, then wait for results
+3. After seeing tool results, summarize them for the user
+4. Don't repeat tool calls - if you already called a tool, wait for results
 
-Example 1 - Run a non-interactive script:
-{"tool": "run_python", "args": {"file_path": "hello.py"}}
+EXAMPLE FLOW:
+User: "List the files"
+You: I'll list the files for you.
+{{"tool": "filesystem_list", "args": {{"path": ""}}}}
+[You receive results]
+You: Here are the files in your directory: [summarize the results]
 
-Example 2 - Run interactive script with test input:
-{"tool": "run_python", "args": {"file_path": "calculator.py", "stdin_input": "5 + 3\\nquit\\n"}}
-
-Example 3 - Run with command line args:
-{"tool": "run_python", "args": {"file_path": "script.py", "args": "--input data.txt"}}
-
-Example 4 - Run pytest:
-{"tool": "run_tests", "args": {"test_path": "test_calculator.py"}}
-
-WHEN WRITING CODE FOR TESTING:
-- Add a simple test mode: if __name__ == '__main__' should demonstrate the code works
-- Include print statements showing results
-- For calculators/converters: print example calculations
-- Avoid infinite loops in test mode
-
-EXAMPLE - Create and test a calculator:
-
-{"tool": "filesystem_write", "args": {"path": "calc.py", "content": "#!/usr/bin/env python3\\n\\ndef add(a, b): return a + b\\ndef sub(a, b): return a - b\\ndef mul(a, b): return a * b\\ndef div(a, b): return a / b if b else 'Error'\\n\\nif __name__ == '__main__':\\n    print('Testing calculator...')\\n    print(f'5 + 3 = {add(5, 3)}')\\n    print(f'10 - 4 = {sub(10, 4)}')\\n    print(f'6 * 7 = {mul(6, 7)}')\\n    print(f'15 / 3 = {div(15, 3)}')\\n    print('All tests passed!')\\n"}}
-
-Then test it:
-{"tool": "run_python", "args": {"file_path": "calc.py"}}
-
-REMEMBER: Take action immediately. Create testable code with example output."""
+Remember: Be helpful, be concise, and don't repeat yourself.""".format(tools_text=tools_text)
 
     # Inject user-defined rules
     rules_text = await get_enabled_rules_text(request.workspace_path or "")
@@ -327,55 +345,136 @@ REMEMBER: Take action immediately. Create testable code with example output."""
     messages_with_system.extend([msg.model_dump() for msg in request.messages])
 
     async def event_generator():
-        accumulated_response = ""
-        tool_calls_executed: set[str] = set()
-        last_sent_length = 0
-        
+        """Multi-turn conversation loop that continues until model is done."""
         import structlog
         logger = structlog.get_logger()
         
+        # Maintain conversation state
+        current_messages = messages_with_system.copy()
+        max_iterations = 5  # Limit iterations to prevent over-eager behavior
+        iteration = 0
+        
         try:
-            async for chunk in model_router.stream(
-                model=request.model,
-                messages=messages_with_system,
-                api_base=request.api_base,
-                api_key=request.api_key,
-            ):
-                if chunk.choices and chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    accumulated_response += content
-
-                    # Check for complete tool calls
-                    tool_calls = extract_tool_calls(accumulated_response)
-                    
-                    logger.info("Tool calls detected", count=len(tool_calls), response_length=len(accumulated_response))
-                    
-                    for tool_call, start, end in tool_calls:
-                        # Skip if already executed
-                        tool_signature = json.dumps(tool_call, sort_keys=True)
-                        if tool_signature in tool_calls_executed:
-                            continue
+            while iteration < max_iterations:
+                iteration += 1
+                accumulated_response = ""
+                last_sent_length = 0
+                tool_calls_found = []
+                
+                logger.info("Starting model stream", iteration=iteration, message_count=len(current_messages))
+                
+                # Stream model response
+                async for chunk in model_router.stream(
+                    model=request.model,
+                    messages=current_messages,
+                    api_base=request.api_base,
+                    api_key=api_key_to_use,  # Use the determined API key
+                ):
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        accumulated_response += content
                         
-                        tool_calls_executed.add(tool_signature)
+                        # Stream text content (check for potential tool calls to pause streaming)
+                        open_braces = accumulated_response.count('{') - accumulated_response.count('}')
+                        recent_chunk = accumulated_response[max(0, len(accumulated_response) - 50):]
+                        has_tool = '{"tool"' in recent_chunk or '"tool"' in recent_chunk
+                        has_args = '"args"' in recent_chunk
+                        looks_like_json_start = has_tool and has_args and open_braces > 0
+                        
+                        if not looks_like_json_start:
+                            # Only strip tool calls if we have a potential complete response
+                            new_content = accumulated_response[last_sent_length:]
+                            
+                            if new_content:
+                                last_sent_length = len(accumulated_response)
+                                data = json.dumps({"token": new_content})
+                                yield f"data: {data}\n\n"
+                
+                # Extract tool calls ONCE after streaming completes (not on every chunk!)
+                tool_calls = extract_tool_calls(accumulated_response)
+                
+                # Track tool calls
+                for tool_call, start, end in tool_calls:
+                    tool_signature = json.dumps(tool_call, sort_keys=True)
+                    if not any(tc["signature"] == tool_signature for tc in tool_calls_found):
+                        tool_calls_found.append({
+                            "call": tool_call,
+                            "start": start,
+                            "end": end,
+                            "signature": tool_signature
+                        })
+                
+                # Strip tool calls from the complete response
+                clean_response = strip_tool_calls(accumulated_response)
+                
+                # Send any remaining content that wasn't streamed (cleaned)
+                # We need to recalculate what we've sent vs what's clean
+                if tool_calls_found:
+                    # If there were tool calls, send the clean version of what we haven't sent
+                    final_data = json.dumps({"token": "\n"})  # Just a newline to separate
+                    yield f"data: {final_data}\n\n"
+                
+                # Add assistant response to conversation (without tool calls)
+                if clean_response.strip():
+                    current_messages.append({
+                        "role": "assistant",
+                        "content": clean_response.strip()
+                    })
+                
+                # Execute any tool calls found
+                if tool_calls_found:
+                    logger.info("Executing tool calls", count=len(tool_calls_found))
+                    
+                    # Collect all tool results
+                    tool_results = []
+                    
+                    for tool_info in tool_calls_found:
+                        tool_call = tool_info["call"]
                         tool_name = tool_call.get("tool")
                         args = tool_call.get("args", {})
                         
                         logger.info("Executing tool", tool=tool_name, args=args)
                         
-                        # Use dynamic tool registry
+                        # Execute tool
                         from prometheus.services.tool_registry import get_registry
-                        
                         registry = get_registry()
+                        # Translate workspace path for Docker container
+                        translated_workspace = translate_host_path_to_container(
+                            request.workspace_path or settings.workspace_path
+                        )
                         result = await registry.execute_tool(
                             name=tool_name,
                             args=args,
-                            context={"workspace_path": request.workspace_path, "mcp_tools": mcp_tools},
+                            context={"workspace_path": translated_workspace, "mcp_tools": mcp_tools},
                         )
                         
-                        logger.info("Tool execution result", result=result)
+                        logger.info("Tool execution result", tool=tool_name, success=result.get("success", False))
                         
+                        # Check if tool requires permission
+                        if result.get("permission_required"):
+                            # Send permission request to frontend
+                            permission_data = json.dumps({
+                                "permission_request": {
+                                    "command": result.get("command"),
+                                    "full_command": result.get("full_command"),
+                                    "tool": tool_name,
+                                    "message": result.get("message"),
+                                }
+                            })
+                            yield f"data: {permission_data}\n\n"
+                            
+                            # Stop execution and wait for user to approve
+                            # The conversation will pause here until user approves the command
+                            # and sends a new message
+                            logger.info("Tool execution requires permission", tool=tool_name, command=result.get("command"))
+                            tool_results.append({
+                                "tool": tool_name,
+                                "result": f"⚠️ Permission required to run command: {result.get('command')}\n\nThis command needs your approval before it can be executed. Please approve or deny this command to continue.",
+                            })
+                            continue
+                        
+                        # Send tool execution result to frontend
                         if result:
-                            # Send tool execution result
                             tool_data = json.dumps({
                                 "tool_execution": {
                                     "tool": tool_name,
@@ -393,37 +492,67 @@ REMEMBER: Take action immediately. Create testable code with example output."""
                                 }
                             })
                             yield f"data: {tool_data}\n\n"
-                    
-                    # Check if we're in the middle of a potential JSON object
-                    # Count unmatched opening braces
-                    open_braces = accumulated_response.count('{') - accumulated_response.count('}')
-                    
-                    # More aggressive streaming - only hold back if we're actively mid-JSON
-                    # Check for both "tool" and "args" to be more confident it's a tool call
-                    recent_chunk = accumulated_response[max(0, len(accumulated_response) - 50):]
-                    has_tool = '{"tool"' in recent_chunk or '"tool"' in recent_chunk
-                    has_args = '"args"' in recent_chunk
-                    looks_like_json_start = has_tool and has_args and open_braces > 0
-                    
-                    if not looks_like_json_start:
-                        # Safe to send - strip any tool calls and send new content
-                        clean_response = strip_tool_calls(accumulated_response)
-                        new_content = clean_response[last_sent_length:]
                         
-                        if new_content:
-                            last_sent_length = len(clean_response)
-                            data = json.dumps({"token": new_content})
-                            yield f"data: {data}\n\n"
+                        # Format tool result for model
+                        if result:
+                            result_text = f"Tool {tool_name} executed successfully." if result.get("success") else f"Tool {tool_name} failed."
+                            
+                            # Handle different result types
+                            if result.get("items"):
+                                # filesystem_list returns items
+                                items = result.get("items", [])
+                                result_text += f"\n\nDirectory listing ({len(items)} items):\n"
+                                for item in items[:50]:  # Limit to 50 items
+                                    item_type = "📁" if item.get("type") == "directory" else "📄"
+                                    result_text += f"{item_type} {item.get('name')}\n"
+                                if len(items) > 50:
+                                    result_text += f"... and {len(items) - 50} more items"
+                            
+                            if result.get("stdout"):
+                                result_text += f"\n\nOutput:\n{result.get('stdout')}"
+                            if result.get("stderr"):
+                                result_text += f"\n\nErrors:\n{result.get('stderr')}"
+                            if result.get("content"):
+                                content = result.get("content", "")
+                                result_text += f"\n\nFile content:\n{content[:2000]}"  # Limit length
+                                if len(content) > 2000:
+                                    result_text += f"\n... (truncated, {len(content)} total chars)"
+                            if result.get("error"):
+                                result_text += f"\n\nError: {result.get('error')}"
+                            if result.get("hint"):
+                                result_text += f"\n\nHint: {result.get('hint')}"
+                            if result.get("message"):
+                                result_text += f"\n\n{result.get('message')}"
+                            
+                            tool_results.append({
+                                "tool": tool_name,
+                                "result": result_text
+                            })
+                    
+                    # Add tool results to conversation so model can continue
+                    if tool_results:
+                        tool_result_message = "Tool execution results:\n"
+                        for tr in tool_results:
+                            tool_result_message += f"\n{tr['tool']}: {tr['result']}\n"
+                        
+                        current_messages.append({
+                            "role": "user",
+                            "content": tool_result_message
+                        })
+                        
+                        logger.info("Added tool results to conversation", result_count=len(tool_results))
+                        # Continue loop to get model's next response
+                        continue
+                
+                # No tool calls found - model is done
+                logger.info("No tool calls found, conversation complete")
+                break
             
-            # Final flush - send any remaining clean content
-            clean_response = strip_tool_calls(accumulated_response)
-            final_content = clean_response[last_sent_length:]
-            if final_content:
-                data = json.dumps({"token": final_content})
-                yield f"data: {data}\n\n"
+            if iteration >= max_iterations:
+                logger.warning("Reached max iterations", max_iterations=max_iterations)
+                yield f"data: {json.dumps({'error': 'Reached maximum iteration limit'})}\n\n"
 
             # Extract and save memories from the conversation
-            # Check user messages for memory requests
             for msg in request.messages:
                 if msg.role == "user":
                     user_memories = extract_memory_requests(msg.content, source="user")
@@ -433,31 +562,40 @@ REMEMBER: Take action immediately. Create testable code with example output."""
                                 content=memory["content"],
                                 source="user",
                                 workspace_path=request.workspace_path,
-                                conversation_id=request.conversation_id,
+                                conversation_id=getattr(request, "conversation_id", None),
                                 tags=memory.get("tags"),
                             )
                             logger.info("Saved user memory", content=memory["content"][:50])
                         except Exception as e:
                             logger.warning("Failed to save memory", error=str(e))
             
-            # Check model response for memory indicators
-            model_memories = extract_memory_requests(clean_response, source="model")
-            for memory in model_memories:
-                try:
-                    await add_memory(
-                        content=memory["content"],
-                        source="model",
-                        workspace_path=request.workspace_path,
-                        conversation_id=request.conversation_id,
-                        tags=memory.get("tags"),
-                    )
-                    logger.info("Saved model memory", content=memory["content"][:50])
-                except Exception as e:
-                    logger.warning("Failed to save model memory", error=str(e))
+            # Check final model response for memory indicators
+            if current_messages:
+                last_assistant_msg = None
+                for msg in reversed(current_messages):
+                    if msg.get("role") == "assistant":
+                        last_assistant_msg = msg.get("content", "")
+                        break
+                
+                if last_assistant_msg:
+                    model_memories = extract_memory_requests(last_assistant_msg, source="model")
+                    for memory in model_memories:
+                        try:
+                            await add_memory(
+                                content=memory["content"],
+                                source="model",
+                                workspace_path=request.workspace_path,
+                                conversation_id=getattr(request, "conversation_id", None),
+                                tags=memory.get("tags"),
+                            )
+                            logger.info("Saved model memory", content=memory["content"][:50])
+                        except Exception as e:
+                            logger.warning("Failed to save model memory", error=str(e))
 
             yield "data: [DONE]\n\n"
             
         except Exception as e:
+            logger.exception("Error in event generator")
             error_data = json.dumps({"error": str(e)})
             yield f"data: {error_data}\n\n"
 

@@ -9,9 +9,20 @@ services:
     network_mode: "host"
     env_file:
       - .env
+    environment:
+      # Database stored in user's home directory
+      - DATABASE_PATH=/root/.prometheus
+      # Workspace path is dynamic - can be set per request
+      # Default is user's home directory or can be overridden via API
     volumes:
       - ./backend/prometheus:/app/prometheus
-      - prometheus_data:/tmp/prometheus_data
+      # Mount user's home .prometheus directory for database persistence
+      - ~/.prometheus:/root/.prometheus
+      # Mount user's home directory for workspace access (read-write for agent)
+      # WARNING: Agent can write to your home directory - use workspacePath in settings to restrict
+      - ~:/host_home
+      # Optional: Mount current directory as default workspace
+      - .:/default_workspace
 
   frontend:
     build:
@@ -19,12 +30,14 @@ services:
       dockerfile: Dockerfile
     ports:
       - "3001:3000"
+    # Use special DNS name that resolves to host from inside container
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      - NODE_ENV=development
-      # Frontend connects to backend via localhost (backend uses host network)
+      - NODE_ENV=production
+      - PORT=3000
+      # Note: The frontend makes API calls from the BROWSER (not the container)
+      # So localhost:8000 works because the browser runs on the host
       - VITE_API_URL=http://localhost:8000
     depends_on:
       - backend
-
-volumes:
-  prometheus_data:

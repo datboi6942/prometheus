@@ -29,6 +29,11 @@ RUN poetry install --only main --no-root
 # Stage 2: Production
 FROM python:3.11-slim AS production
 
+# Install git for git operations
+RUN apt-get update && apt-get install -y \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV VENV_PATH="/opt/pysetup/.venv"
 ENV PATH="$VENV_PATH/bin:$PATH"
 

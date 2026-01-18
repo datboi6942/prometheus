@@ -1,14 +1,50 @@
 """API routes for MCP server management."""
+import os
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
 
 from prometheus import database as db
 from prometheus.services.mcp_loader import load_mcp_server_tools
 from prometheus.services.tool_registry import get_registry
 
+logger = structlog.get_logger()
+
 router = APIRouter(prefix="/api/v1/mcp")
+
+# Security: API endpoint authentication is optional and can be enabled for production
+# Most local MCP servers don't require authentication - configure per server in config
+# Set ENABLE_MCP_API_AUTH=true to require X-API-Key header for API endpoints
+ENABLE_MCP_API_AUTH = os.getenv("ENABLE_MCP_API_AUTH", "false").lower() == "true"
+MCP_API_KEY = os.getenv("MCP_API_KEY", "")
+
+
+async def verify_mcp_api_auth(x_api_key: str | None = Header(None, alias="X-API-Key")) -> None:
+    """Verify authentication for MCP API management endpoints.
+    
+    This protects the endpoints that allow registering/updating MCP servers.
+    Individual MCP servers can specify their own auth requirements in their config.
+    
+    **Note**: Most local MCP servers don't require authentication. This is only
+    for protecting the API endpoints that manage server configurations.
+    
+    Raises:
+        HTTPException: If authentication is required and fails.
+    """
+    if not ENABLE_MCP_API_AUTH:
+        # Auth disabled by default - fine for local development
+        # Enable in production to prevent unauthorized server registration
+        return
+    
+    if not MCP_API_KEY:
+        logger.error("MCP_API_KEY not set but ENABLE_MCP_API_AUTH is true")
+        raise HTTPException(status_code=500, detail="MCP API authentication misconfigured")
+    
+    if not x_api_key or x_api_key != MCP_API_KEY:
+        logger.warning("MCP API endpoint access denied - invalid API key")
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 # Request models
@@ -58,11 +94,17 @@ async def get_mcp_server(name: str) -> dict[str, Any]:
 
 
 @router.post("/servers")
-async def create_mcp_server(request: CreateMCPServerRequest) -> dict[str, Any]:
+async def create_mcp_server(
+    request: CreateMCPServerRequest,
+    _: None = Depends(verify_mcp_api_auth),
+) -> dict[str, Any]:
     """Create a new MCP server.
 
+    **Note**: Most local MCP servers don't require authentication. Configure
+    per-server authentication in the server's config if needed.
+
     Args:
-        request: Server configuration.
+        request: Server configuration. Can include auth config per server.
 
     Returns:
         dict: Created server.
@@ -77,7 +119,11 @@ async def create_mcp_server(request: CreateMCPServerRequest) -> dict[str, Any]:
 
 
 @router.put("/servers/{name}")
-async def update_mcp_server(name: str, request: UpdateMCPServerRequest) -> dict[str, Any]:
+async def update_mcp_server(
+    name: str,
+    request: UpdateMCPServerRequest,
+    _: None = Depends(verify_mcp_api_auth),
+) -> dict[str, Any]:
     """Update an MCP server.
 
     Args:
@@ -101,7 +147,10 @@ async def update_mcp_server(name: str, request: UpdateMCPServerRequest) -> dict[
 
 
 @router.delete("/servers/{name}")
-async def delete_mcp_server(name: str) -> dict[str, Any]:
+async def delete_mcp_server(
+    name: str,
+    _: None = Depends(verify_mcp_api_auth),
+) -> dict[str, Any]:
     """Delete an MCP server.
 
     Args:
@@ -132,7 +181,10 @@ async def list_tools() -> dict[str, Any]:
 
 
 @router.post("/servers/{name}/reload")
-async def reload_mcp_server(name: str) -> dict[str, Any]:
+async def reload_mcp_server(
+    name: str,
+    _: None = Depends(verify_mcp_api_auth),
+) -> dict[str, Any]:
     """Reload tools from an MCP server.
 
     Args:

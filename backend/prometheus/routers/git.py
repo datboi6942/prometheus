@@ -4,7 +4,8 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from prometheus.config import settings
+from prometheus.config import settings, translate_host_path_to_container
+from prometheus.database import get_setting
 from prometheus.services.git_service import GitService
 from prometheus.services.github_service import GitHubService
 
@@ -96,7 +97,9 @@ def get_git_service(workspace_path: str | None = None) -> GitService:
     Returns:
         GitService: Git service instance.
     """
-    path = workspace_path or settings.workspace_path
+    raw_path = workspace_path or settings.workspace_path
+    # Translate host paths to container paths (for Docker)
+    path = translate_host_path_to_container(raw_path)
     return GitService(path)
 
 
@@ -126,7 +129,8 @@ async def get_status(
         dict: Git status information.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     return git_service.get_status()
 
 
@@ -145,7 +149,8 @@ async def init_repo(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.init_repo()
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to initialize repository"))
@@ -169,7 +174,8 @@ async def stage_files(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.stage_files(request.files)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to stage files"))
@@ -193,7 +199,8 @@ async def unstage_files(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.unstage_files(request.files)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to unstage files"))
@@ -217,7 +224,8 @@ async def commit(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.commit(request.message, request.allow_empty)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to create commit"))
@@ -239,7 +247,8 @@ async def get_branches(
         dict: List of branches.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     return git_service.get_branches()
 
 
@@ -260,7 +269,8 @@ async def create_branch(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.create_branch(request.name)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to create branch"))
@@ -284,7 +294,8 @@ async def checkout_branch(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.checkout_branch(request.name)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to checkout branch"))
@@ -308,7 +319,8 @@ async def delete_branch(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.delete_branch(request.name, request.force)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to delete branch"))
@@ -332,7 +344,8 @@ async def get_diff(
         dict: Diff output.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     return git_service.get_diff(file_path)
 
 
@@ -351,7 +364,8 @@ async def get_staged_diff(
         dict: Staged diff output.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     return git_service.get_staged_diff()
 
 
@@ -372,7 +386,8 @@ async def add_remote(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.add_remote(request.name, request.url)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to add remote"))
@@ -396,7 +411,8 @@ async def push(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.push(request.remote, request.branch, request.set_upstream)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to push"))
@@ -420,7 +436,8 @@ async def pull(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.pull(request.remote, request.branch)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to pull"))
@@ -444,7 +461,8 @@ async def fetch(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.fetch(remote)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to fetch"))
@@ -468,7 +486,8 @@ async def get_log(
         dict: Commit log.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     return git_service.get_log(limit)
 
 
@@ -489,7 +508,8 @@ async def clone_repo(
         dict: Operation result.
     """
     if workspace_path:
-        git_service = GitService(workspace_path)
+        translated_path = translate_host_path_to_container(workspace_path)
+        git_service = GitService(translated_path)
     result = git_service.clone(request.url, request.directory)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Failed to clone repository"))
