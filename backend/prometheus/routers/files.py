@@ -123,22 +123,10 @@ async def delete_file(
     Raises:
         HTTPException: If file deletion fails.
     """
-    try:
-        from pathlib import Path
+    result = mcp_tools.filesystem_delete(path)
 
-        full_path = mcp_tools._validate_path(path)
+    if "error" in result:
+        status_code = 404 if "not found" in result["error"].lower() else 500
+        raise HTTPException(status_code=status_code, detail=result["error"])
 
-        if not full_path.exists():
-            raise HTTPException(status_code=404, detail=f"File not found: {path}")
-
-        if full_path.is_dir():
-            full_path.rmdir()
-        else:
-            full_path.unlink()
-
-        return {"success": True, "path": path, "action": "deleted"}
-
-    except ValueError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return result

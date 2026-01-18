@@ -146,6 +146,34 @@ class MCPTools:
         except Exception as e:
             return {"error": str(e)}
 
+    def filesystem_delete(self, path: str) -> dict[str, Any]:
+        """Delete a file or directory in the workspace.
+
+        Args:
+            path (str): Relative path within workspace.
+
+        Returns:
+            dict[str, Any]: Operation result.
+        """
+        try:
+            full_path = self._validate_path(path)
+
+            if not full_path.exists():
+                return {"error": f"File not found: {path}"}
+
+            if full_path.is_dir():
+                full_path.rmdir()
+                action = "deleted_directory"
+            else:
+                full_path.unlink()
+                action = "deleted"
+
+            return {"success": True, "path": path, "action": action}
+        except ValueError as e:
+            return {"error": str(e)}
+        except Exception as e:
+            return {"error": str(e)}
+
     def run_python(
         self, file_path: str, stdin_input: str = "", args: str = ""
     ) -> dict[str, Any]:
