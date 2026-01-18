@@ -470,14 +470,21 @@ class GitHubService:
         try:
             repo = self.github.get_repo(repo_full_name)
             issue = repo.get_issue(issue_number)
+
+            # Build update kwargs to consolidate into single API call
+            update_kwargs = {}
             if title:
-                issue.edit(title=title)
+                update_kwargs['title'] = title
             if body:
-                issue.edit(body=body)
+                update_kwargs['body'] = body
             if state:
-                issue.edit(state=state)
+                update_kwargs['state'] = state
             if labels is not None:
-                issue.edit(labels=labels)
+                update_kwargs['labels'] = labels
+
+            if update_kwargs:
+                issue.edit(**update_kwargs)
+
             return {
                 "success": True,
                 "number": issue.number,
