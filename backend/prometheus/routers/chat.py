@@ -546,13 +546,27 @@ Remember: Be helpful, be concise, and don't repeat yourself.""".format(tools_tex
                         tool_result_message = "Tool execution results:\n"
                         for tr in tool_results:
                             tool_result_message += f"\n{tr['tool']}: {tr['result']}\n"
-                        
+
                         current_messages.append({
                             "role": "user",
                             "content": tool_result_message
                         })
-                        
+
                         logger.info("Added tool results to conversation", result_count=len(tool_results))
+
+                        # Check if we need to compress after adding tool results
+                        current_messages, updated_context_info = await check_and_compress_if_needed(
+                            messages=current_messages,
+                            model=request.model,
+                            auto_compress=True
+                        )
+
+                        # If compression occurred, notify frontend
+                        if updated_context_info.get("compressed"):
+                            logger.info("Compressed during multi-turn loop", **updated_context_info)
+                            compression_notification = json.dumps({"context_info": updated_context_info})
+                            yield f"data: {compression_notification}\n\n"
+
                         # Continue loop to get model's next response
                         continue
                 
