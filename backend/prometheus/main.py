@@ -3,7 +3,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from prometheus.config import settings
-from prometheus.routers import chat, health
+from prometheus.database import init_db
+from prometheus.routers import chat, conversations, files, health
 
 # Configure structlog
 structlog.configure(
@@ -38,12 +39,17 @@ app.add_middleware(
 # Include routers
 app.include_router(health.router)
 app.include_router(chat.router)
+app.include_router(files.router)
+app.include_router(conversations.router)
 
 
 @app.on_event("startup")
 async def startup_event() -> None:
     """Run startup tasks."""
     logger.info("Starting Prometheus API", log_level=settings.log_level)
+    # Initialize database
+    await init_db()
+    logger.info("Database initialized")
 
 
 if __name__ == "__main__":
