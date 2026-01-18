@@ -382,12 +382,11 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
             while iteration < max_iterations:
                 iteration += 1
                 accumulated_response = ""
-                last_sent_length = 0
                 tool_calls_found = []
                 
                 logger.info("Starting model stream", iteration=iteration, message_count=len(current_messages))
                 
-                # Stream model response
+                # Stream model response - buffer entire response to prevent tool JSON from leaking
                 async for chunk in model_router.stream(
                     model=request.model,
                     messages=current_messages,
@@ -397,34 +396,7 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
                     if chunk.choices and chunk.choices[0].delta.content:
                         content = chunk.choices[0].delta.content
                         accumulated_response += content
-
-                        # More aggressive buffering to prevent JSON from leaking through
-                        # Check if we're potentially in a tool call by looking for opening braces
-                        # followed by "tool" keyword
-                        open_braces = accumulated_response.count('{') - accumulated_response.count('}')
-                        # Look at a larger window to catch tool calls early
-                        recent_chunk = accumulated_response[max(0, len(accumulated_response) - 100):]
-
-                        # Check for various tool call patterns
-                        has_tool_pattern = (
-                            '{"tool"' in recent_chunk or
-                            '{ "tool"' in recent_chunk or
-                            '"tool":' in recent_chunk or
-                            '"tool" :' in recent_chunk
-                        )
-                        has_args = '"args"' in recent_chunk
-
-                        # If we have open braces and see tool/args keywords, we're likely in a tool call
-                        looks_like_json_start = (open_braces > 0 and (has_tool_pattern or has_args))
-
-                        if not looks_like_json_start:
-                            # Only send content if we're confident it's not a tool call
-                            new_content = accumulated_response[last_sent_length:]
-
-                            if new_content:
-                                last_sent_length = len(accumulated_response)
-                                data = json.dumps({"token": new_content})
-                                yield f"data: {data}\n\n"
+                        # Don't stream anything yet - wait until we can extract and strip tool calls
 
                 # Extract tool calls ONCE after streaming completes (not on every chunk!)
                 tool_calls = extract_tool_calls(accumulated_response)
@@ -452,15 +424,10 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
                 # Strip tool calls from the complete response
                 clean_response = strip_tool_calls(accumulated_response)
 
-                # Send any remaining content that wasn't streamed (cleaned)
-                # Calculate what clean content we haven't sent yet
-                if last_sent_length < len(accumulated_response):
-                    # We have buffered content that wasn't sent (likely due to tool call detection)
-                    # Send the clean version now
-                    remaining_clean = clean_response[min(last_sent_length, len(clean_response)):]
-                    if remaining_clean.strip():
-                        final_data = json.dumps({"token": remaining_clean})
-                        yield f"data: {final_data}\n\n"
+                # Send the clean response (all at once, after stripping tool calls)
+                if clean_response.strip():
+                    final_data = json.dumps({"token": clean_response})
+                    yield f"data: {final_data}\n\n"
                 
                 # Add assistant response to conversation (without tool calls)
                 if clean_response.strip():
