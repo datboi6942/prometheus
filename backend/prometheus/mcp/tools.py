@@ -11,6 +11,8 @@ from pydantic import BaseModel
 
 class FileReadRequest(BaseModel):
     path: str
+    offset: int | None = None  # Starting line (1-indexed)
+    limit: int | None = None   # Number of lines to read
 
 
 class FileWriteRequest(BaseModel):
@@ -21,6 +23,16 @@ class FileWriteRequest(BaseModel):
 class ShellExecuteRequest(BaseModel):
     command: str
     cwd: str | None = None
+
+
+class GrepRequest(BaseModel):
+    pattern: str
+    path: str
+    recursive: bool = False
+    case_insensitive: bool = False
+    show_line_numbers: bool = True
+    files_only: bool = False
+    context_lines: int = 0
 
 
 class MCPTools:
@@ -134,11 +146,15 @@ class MCPTools:
             "hunks": hunks,
         }
 
-    def filesystem_read(self, path: str) -> dict[str, Any]:
+    def filesystem_read(
+        self, path: str, offset: int | None = None, limit: int | None = None
+    ) -> dict[str, Any]:
         """Read a file from the workspace.
 
         Args:
             path (str): Relative path within workspace.
+            offset (int | None): Starting line number (1-indexed). If None, starts from beginning.
+            limit (int | None): Number of lines to read. If None, reads to end.
 
         Returns:
             dict[str, Any]: File content and metadata.
@@ -149,14 +165,60 @@ class MCPTools:
                 return {"error": f"File not found: {path}"}
 
             with open(full_path, "r", encoding="utf-8") as f:
-                content = f.read()
+                all_lines = f.readlines()
 
-            return {
-                "success": True,
-                "path": path,
-                "content": content,
-                "size": len(content),
-            }
+            total_lines = len(all_lines)
+
+            # Apply offset and limit if provided
+            if offset is not None or limit is not None:
+                start_idx = (offset - 1) if offset and offset > 0 else 0
+                end_idx = (start_idx + limit) if limit else total_lines
+
+                # Clamp to valid range
+                start_idx = max(0, min(start_idx, total_lines))
+                end_idx = max(start_idx, min(end_idx, total_lines))
+
+                selected_lines = all_lines[start_idx:end_idx]
+                content = "".join(selected_lines)
+
+                # Add line numbers for context
+                numbered_content = ""
+                for i, line in enumerate(selected_lines, start=start_idx + 1):
+                    numbered_content += f"{i:6d}\t{line}"
+
+                return {
+                    "success": True,
+                    "path": path,
+                    "content": numbered_content,
+                    "raw_content": content,
+                    "total_lines": total_lines,
+                    "showing_lines": f"{start_idx + 1}-{end_idx}",
+                    "offset": start_idx + 1,
+                    "limit": end_idx - start_idx,
+                }
+            else:
+                # Return full content with line numbers for files under 2000 lines
+                content = "".join(all_lines)
+
+                if total_lines <= 2000:
+                    numbered_content = ""
+                    for i, line in enumerate(all_lines, start=1):
+                        numbered_content += f"{i:6d}\t{line}"
+                    display_content = numbered_content
+                else:
+                    # For very large files, show truncated with hint
+                    display_content = "".join(all_lines[:1000])
+                    display_content += f"\n\n... [{total_lines - 2000} lines omitted] ...\n\n"
+                    display_content += "".join(all_lines[-1000:])
+
+                return {
+                    "success": True,
+                    "path": path,
+                    "content": display_content,
+                    "raw_content": content,
+                    "total_lines": total_lines,
+                    "size": len(content),
+                }
         except Exception as e:
             return {"error": str(e)}
 
@@ -451,6 +513,156 @@ class MCPTools:
             return {"success": True, "path": path, "action": action}
         except ValueError as e:
             return {"error": str(e)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def grep(
+        self,
+        pattern: str,
+        path: str = "",
+        recursive: bool = False,
+        case_insensitive: bool = False,
+        show_line_numbers: bool = True,
+        files_only: bool = False,
+        context_lines: int = 0,
+    ) -> dict[str, Any]:
+        """Search for pattern in files (like Linux grep).
+
+        Args:
+            pattern (str): Regular expression pattern to search for.
+            path (str): File or directory path to search (empty for workspace root).
+            recursive (bool): Search recursively in directories.
+            case_insensitive (bool): Case-insensitive search.
+            show_line_numbers (bool): Show line numbers in results.
+            files_only (bool): Only show filenames with matches (like grep -l).
+            context_lines (int): Number of context lines to show around matches.
+
+        Returns:
+            dict[str, Any]: Search results with matches.
+        """
+        try:
+            if path:
+                full_path = self._validate_path(path)
+            else:
+                full_path = self.workspace_path
+
+            if not full_path.exists():
+                return {"error": f"Path not found: {path}"}
+
+            # Compile regex pattern
+            flags = re.IGNORECASE if case_insensitive else 0
+            try:
+                regex = re.compile(pattern, flags)
+            except re.error as e:
+                return {"error": f"Invalid regex pattern: {e}"}
+
+            matches = []
+            files_searched = 0
+            total_matches = 0
+
+            def search_file(file_path: Path) -> None:
+                """Search a single file for pattern matches."""
+                nonlocal files_searched, total_matches
+
+                try:
+                    # Skip binary files and very large files
+                    if file_path.stat().st_size > 10_000_000:  # Skip files > 10MB
+                        return
+
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()
+
+                    files_searched += 1
+                    matched_lines = []
+
+                    for line_num, line in enumerate(lines, start=1):
+                        if regex.search(line):
+                            matched_lines.append(line_num)
+
+                    if matched_lines:
+                        total_matches += len(matched_lines)
+                        relative_path = str(file_path.relative_to(self.workspace_path))
+
+                        if files_only:
+                            # Just return filename
+                            matches.append({
+                                "file": relative_path,
+                                "match_count": len(matched_lines)
+                            })
+                        else:
+                            # Return detailed matches with context
+                            file_matches = []
+                            for line_num in matched_lines:
+                                match_info = {
+                                    "line_number": line_num,
+                                    "line": lines[line_num - 1].rstrip()
+                                }
+
+                                # Add context lines if requested
+                                if context_lines > 0:
+                                    context_before = []
+                                    context_after = []
+
+                                    for i in range(1, context_lines + 1):
+                                        if line_num - i > 0:
+                                            context_before.insert(0, {
+                                                "line_number": line_num - i,
+                                                "line": lines[line_num - i - 1].rstrip()
+                                            })
+                                        if line_num + i <= len(lines):
+                                            context_after.append({
+                                                "line_number": line_num + i,
+                                                "line": lines[line_num + i - 1].rstrip()
+                                            })
+
+                                    if context_before:
+                                        match_info["context_before"] = context_before
+                                    if context_after:
+                                        match_info["context_after"] = context_after
+
+                                file_matches.append(match_info)
+
+                            matches.append({
+                                "file": relative_path,
+                                "match_count": len(matched_lines),
+                                "matches": file_matches
+                            })
+
+                except (UnicodeDecodeError, PermissionError):
+                    # Skip files that can't be read
+                    pass
+
+            # Search files
+            if full_path.is_file():
+                # Search single file
+                search_file(full_path)
+            elif full_path.is_dir():
+                # Search directory
+                if recursive:
+                    # Recursive search
+                    for file_path in full_path.rglob("*"):
+                        if file_path.is_file() and not file_path.name.startswith("."):
+                            search_file(file_path)
+                else:
+                    # Non-recursive search (only immediate files)
+                    for file_path in full_path.iterdir():
+                        if file_path.is_file() and not file_path.name.startswith("."):
+                            search_file(file_path)
+            else:
+                return {"error": f"Path is neither file nor directory: {path}"}
+
+            return {
+                "success": True,
+                "pattern": pattern,
+                "path": path or ".",
+                "files_searched": files_searched,
+                "total_matches": total_matches,
+                "files_with_matches": len(matches),
+                "matches": matches,
+                "case_insensitive": case_insensitive,
+                "recursive": recursive,
+            }
+
         except Exception as e:
             return {"error": str(e)}
 

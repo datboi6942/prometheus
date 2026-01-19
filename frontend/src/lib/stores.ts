@@ -109,6 +109,7 @@ export const toolExecutions = writable<Array<{
 	timestamp: Date;
 	return_code?: number;
 	hint?: string;
+	args?: Record<string, any>;
 	diff?: {
 		format: string;
 		stats: { lines_added: number; lines_removed: number; lines_changed: number };
@@ -135,3 +136,20 @@ export const githubUser = writable<any>(null);
 // Connection State
 export const isConnected = writable(false);
 export const abortController = writable<AbortController | null>(null);
+
+// Iteration Progress (for agentic loops)
+export const iterationProgress = writable<{
+	current: number;
+	max: number;
+	message_count: number;
+	read_ops?: number;
+	edit_ops?: number;
+} | null>(null);
+
+// Iteration Warning (when approaching limit)
+export const iterationWarning = writable<{
+	current: number;
+	max: number;
+	remaining: number;
+	message: string;
+} | null>(null);

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Terminal as TerminalIcon, X, Trash2 } from 'lucide-svelte';
+	import { Terminal as TerminalIcon, X, Trash2, Plus, Minus, FileText } from 'lucide-svelte';
 	import { showTerminalPanel, toolExecutions } from '$lib/stores';
 
 	function clearTerminal() {
@@ -8,6 +8,10 @@
 
 	function formatTimestamp(date: Date): string {
 		return date.toLocaleTimeString();
+	}
+
+	function isFileOperation(type: string): boolean {
+		return ['filesystem_write', 'filesystem_replace_lines', 'filesystem_search_replace', 'filesystem_insert', 'filesystem_read'].includes(type);
 	}
 </script>
 
@@ -88,6 +92,31 @@
 						{#if execution.return_code !== undefined}
 							<div class="text-slate-500 text-[10px]">
 								exit code: <span class="{execution.return_code === 0 ? 'text-green-400' : 'text-red-400'}">{execution.return_code}</span>
+							</div>
+						{/if}
+
+						<!-- Diff Summary for file operations -->
+						{#if execution.diff && execution.diff.stats}
+							<div class="mt-2 bg-purple-950/30 border-l-2 border-purple-500 p-2 rounded">
+								<div class="flex items-center gap-2 mb-2">
+									<FileText class="w-3 h-3 text-purple-400" />
+									<span class="text-purple-400 text-[10px] uppercase tracking-wider">Changes Applied</span>
+								</div>
+								<div class="flex items-center gap-4 text-xs">
+									<span class="flex items-center gap-1 text-green-400">
+										<Plus class="w-3 h-3" />
+										{execution.diff.stats.lines_added} added
+									</span>
+									<span class="flex items-center gap-1 text-red-400">
+										<Minus class="w-3 h-3" />
+										{execution.diff.stats.lines_removed} removed
+									</span>
+									{#if execution.diff.stats.lines_changed > 0}
+										<span class="text-slate-400">
+											({execution.diff.stats.lines_changed} modified)
+										</span>
+									{/if}
+								</div>
 							</div>
 						{/if}
 
