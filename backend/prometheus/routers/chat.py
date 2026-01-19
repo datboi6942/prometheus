@@ -422,7 +422,7 @@ CRITICAL REMINDERS:
         completed_edits = set()  # Track (path, start_line, end_line, content_hash) tuples
 
         # Helper to execute a single tool and yield results
-        async def execute_and_yield_tool(tool_call: dict) -> tuple[str, dict]:
+        async def execute_and_yield_tool(tool_call: dict) -> tuple[str, dict, str, dict]:
             """Execute a tool call and yield results to frontend. Returns (result_text, result_dict)."""
             nonlocal completed_edits, read_only_operations, edit_operations, files_read
             
