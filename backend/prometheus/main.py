@@ -81,10 +81,14 @@ async def startup_event() -> None:
     
     # Register basic filesystem tools as fallbacks
     fallback_tools = {
-        "filesystem_read": ("Read a file from the workspace", {"path": {"type": "string"}}),
-        "filesystem_write": ("Write content to a file", {"path": {"type": "string"}, "content": {"type": "string"}}),
+        "filesystem_read": ("Read file from workspace. Optional: offset (start line, 1-indexed), limit (number of lines)", {"path": {"type": "string"}, "offset": {"type": "integer", "optional": True}, "limit": {"type": "integer", "optional": True}}),
+        "filesystem_write": ("Write content to a file (creates new or replaces entire file)", {"path": {"type": "string"}, "content": {"type": "string"}}),
+        "filesystem_replace_lines": ("Replace specific line range in a file", {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}, "replacement": {"type": "string"}}),
+        "filesystem_search_replace": ("Search and replace text in a file", {"path": {"type": "string"}, "search": {"type": "string"}, "replace": {"type": "string"}, "count": {"type": "integer", "default": -1}}),
+        "filesystem_insert": ("Insert content at a specific line in a file", {"path": {"type": "string"}, "line_number": {"type": "integer"}, "content": {"type": "string"}}),
         "filesystem_list": ("List directory contents", {"path": {"type": "string", "default": ""}}),
         "filesystem_delete": ("Delete a file or directory", {"path": {"type": "string"}}),
+        "grep": ("Search for pattern in files (like Linux grep). Supports regex, recursive search, case-insensitive matching", {"pattern": {"type": "string"}, "path": {"type": "string", "default": ""}, "recursive": {"type": "boolean", "default": False}, "case_insensitive": {"type": "boolean", "default": False}, "files_only": {"type": "boolean", "default": False}, "context_lines": {"type": "integer", "default": 0}}),
     }
     
     for tool_name, (description, params) in fallback_tools.items():

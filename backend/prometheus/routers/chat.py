@@ -16,7 +16,7 @@ from prometheus.database import (
 from prometheus.mcp.tools import MCPTools
 from prometheus.routers.health import get_model_router
 from prometheus.services.model_router import ModelRouter
-from prometheus.services.context_manager import check_and_compress_if_needed, model_is_reasoning
+from prometheus.services.context_manager import check_and_compress_if_needed, is_reasoning_model
 
 router = APIRouter(prefix="/api/v1")
 logger = structlog.get_logger()
@@ -302,44 +302,73 @@ async def chat_stream(
     
     tools_text = "\n".join(tools_list) if tools_list else "No tools available"
 
-    # System prompt - kept simple and clear
-    system_prompt = """You are Prometheus, a helpful AI coding assistant with access to tools.
+    # System prompt - Claude Code inspired, focused and effective
+    system_prompt = """You are Prometheus, an expert AI coding assistant. You help users with software engineering tasks by reading, writing, and modifying code.
 
-AVAILABLE TOOLS:
+TOOLS:
 {tools_text}
 
-HOW TO USE TOOLS:
-When you need to use a tool, output this JSON format:
+TOOL FORMAT - Output exactly this JSON when using tools:
 {{"tool": "TOOL_NAME", "args": {{"param": "value"}}}}
 
-After you use a tool, you will receive the results automatically. You can then continue with more tool calls if needed, or explain the results to the user.
+CORE PRINCIPLES:
 
-IMPORTANT GUIDELINES:
-1. For greetings or simple questions - just respond, no tools needed
-2. Use ONE tool at a time - you will get results automatically, then you can continue
-3. For tasks requiring multiple operations (like deleting multiple files), make sequential tool calls
-4. After each tool result, either make another tool call OR explain the results to the user
-5. Don't repeat tool calls unnecessarily
+1. ACT, DON'T JUST TALK
+   - When you say "I'll do X" - DO IT IMMEDIATELY with a tool call
+   - Never end a response with "Let me..." or "I'll..." without the actual tool call
+   - Reading a file is step 1. Editing is step 2. Always complete both.
 
-EXAMPLE FLOW:
-User: "List the files"
-You: I'll list the files for you.
-{{"tool": "filesystem_list", "args": {{"path": ""}}}}
-[You receive results automatically]
-You: Here are the files in your directory: [summarize the results]
+2. ONE TOOL AT A TIME
+   - Call one tool, wait for results, then continue
+   - You'll automatically receive tool results - no need to ask
 
-EXAMPLE MULTI-STEP FLOW:
-User: "Delete all .txt files"
-You: I'll delete all .txt files. First, let me list them.
-{{"tool": "filesystem_list", "args": {{"path": ""}}}}
-[You receive results showing file1.txt, file2.txt]
-You: {{"tool": "filesystem_delete", "args": {{"path": "file1.txt"}}}}
-[You receive results]
-You: {{"tool": "filesystem_delete", "args": {{"path": "file2.txt"}}}}
-[You receive results]
-You: I've successfully deleted both .txt files.
+3. USE THE RIGHT TOOL FOR EDITS
+   - grep: Search for patterns across files (supports regex, recursive, case-insensitive)
+   - filesystem_read: Read files (path required, optional: offset/limit for large files)
+   - filesystem_replace_lines: Replace specific lines (use start_line, end_line, replacement)
+   - filesystem_search_replace: Find and replace text patterns
+   - filesystem_insert: Add new lines at a position
+   - filesystem_write: ONLY for creating NEW files
 
-Remember: Be helpful, be concise, and continue making tool calls until the task is complete.""".format(tools_text=tools_text)
+   NEVER use filesystem_write on existing files - use targeted edits instead!
+
+4. FIX ERRORS EFFICIENTLY
+   - When you see an error, identify the exact line and fix it
+   - Don't re-read files you just read - use the content you have
+   - Don't create helper scripts - use your tools directly
+   - If an edit fails, check the error message and adjust your approach
+
+5. COMPLETE THE TASK
+   - Keep making tool calls until the job is 100% done
+   - Don't stop after reading - make the actual changes
+   - Don't stop after one edit if more are needed
+   - Summarize what you did only AFTER finishing
+
+WORKFLOW EXAMPLE:
+User: "Fix the syntax error in app.py"
+
+{{"tool": "filesystem_read", "args": {{"path": "app.py"}}}}
+[Results show line 42 has missing colon]
+
+Found the issue on line 42. Fixing now.
+{{"tool": "filesystem_replace_lines", "args": {{"path": "app.py", "start_line": 42, "end_line": 42, "replacement": "def process_data(x):\\n"}}}}
+[Success]
+
+Fixed the syntax error - added missing colon on line 42.
+
+CRITICAL REMINDERS:
+- filesystem_read supports optional offset/limit for large files, but usually just read the whole file
+- Always use filesystem_replace_lines/search_replace/insert for existing files
+- Never output partial tool JSON - complete the full {{"tool": ..., "args": ...}} structure
+- Be concise - users want results, not lengthy explanations
+
+🚨 ANTI-ANALYSIS-PARALYSIS RULES:
+- After reading 1-2 files, you MUST start making edits. Do NOT read more than necessary.
+- If you see an error, identify the line and FIX IT IMMEDIATELY in the same turn.
+- DO NOT re-read a file you already read. Use the content you have.
+- DO NOT explain what you "will" do - just DO IT with a tool call.
+- Your job is to COMPLETE tasks, not just analyze them. Every response should include action.
+- If the user shows an error, your FIRST read should be followed by an EDIT in the same turn.""".format(tools_text=tools_text)
 
     # Inject user-defined rules
     rules_text = await get_enabled_rules_text(request.workspace_path or "")
@@ -375,8 +404,169 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
 
         # Maintain conversation state (use compressed messages)
         current_messages = messages_to_use.copy()
-        max_iterations = 5  # Limit iterations to prevent over-eager behavior
+        max_iterations = 50  # Allow enough iterations to complete complex tasks (large files, multi-step operations)
         iteration = 0
+        lazy_kick_count = 0  # Track how many times we've kicked the agent for being lazy
+        max_lazy_kicks = 3  # Don't kick more than 3 times per iteration to avoid infinite loops
+        consecutive_lazy_kicks = 0  # Track consecutive lazy kicks (resets after tool execution)
+        
+        # Track read vs edit operations to detect analysis paralysis
+        read_only_operations = 0  # filesystem_read, grep, filesystem_list
+        edit_operations = 0  # filesystem_write, filesystem_replace_lines, filesystem_insert, etc.
+        max_reads_before_nudge = 2  # After this many reads without edits, nudge the agent
+        max_reads_before_block = 5  # After this many, REFUSE more reads and force edit
+        task_started = False  # Track if the agent has started working on the task
+        files_read = set()  # Track which files have been read to prevent re-reading
+        
+        # Cross-iteration deduplication for edits (prevent same edit being made multiple times)
+        completed_edits = set()  # Track (path, start_line, end_line, content_hash) tuples
+
+        # Helper to execute a single tool and yield results
+        async def execute_and_yield_tool(tool_call: dict) -> tuple[str, dict, str, dict]:
+            """Execute a tool call and yield results to frontend. Returns (result_text, result_dict)."""
+            nonlocal completed_edits, read_only_operations, edit_operations, files_read
+            
+            tool_name = tool_call.get("tool")
+            args = tool_call.get("args", {})
+            
+            # Block read operations if agent is in analysis paralysis mode
+            read_tools = {'filesystem_read', 'grep', 'filesystem_list', 'filesystem_search'}
+            if tool_name in read_tools and read_only_operations >= max_reads_before_block and edit_operations == 0:
+                logger.warning("BLOCKING read operation - agent in analysis paralysis", 
+                              tool=tool_name, read_ops=read_only_operations)
+                return (
+                    f"🛑 BLOCKED: {tool_name} is disabled. You have done {read_only_operations} reads with 0 edits.\n"
+                    f"You MUST use an edit tool now: filesystem_replace_lines, filesystem_search_replace, or filesystem_insert.\n"
+                    f"Make the fix based on what you've already read.",
+                    {"success": False, "blocked": True, "reason": "analysis_paralysis"},
+                    tool_name,
+                    args
+                )
+            
+            # Track and warn about re-reading the same file
+            if tool_name == 'filesystem_read':
+                file_path = args.get("path", "")
+                if file_path in files_read:
+                    logger.warning("Agent re-reading same file", path=file_path)
+                    return (
+                        f"⚠️ You already read '{file_path}'! Use the content you have.\n"
+                        f"DO NOT read the same file twice. Make your edit NOW:\n"
+                        f'{{"tool": "filesystem_replace_lines", "args": {{"path": "{file_path}", "start_line": N, "end_line": M, "replacement": "fixed code"}}}}',
+                        {"success": True, "duplicate_read": True, "path": file_path},
+                        tool_name,
+                        args
+                    )
+                files_read.add(file_path)
+
+            logger.info("Executing tool inline", tool=tool_name, args=args)
+            
+            # Check for duplicate edit operations
+            edit_tools = {'filesystem_write', 'filesystem_replace_lines', 'filesystem_insert', 
+                          'filesystem_search_replace'}
+            if tool_name in edit_tools:
+                # Create a signature for this edit
+                path = args.get("path", "")
+                start_line = args.get("start_line", 0)
+                end_line = args.get("end_line", 0)
+                content = args.get("content", args.get("replacement", args.get("replace", "")))
+                content_hash = hash(content) if content else 0
+                
+                edit_signature = (path, start_line, end_line, content_hash)
+                
+                if edit_signature in completed_edits:
+                    logger.warning("Skipping duplicate edit", tool=tool_name, path=path, 
+                                  start_line=start_line, end_line=end_line)
+                    return (
+                        f"⚠️ DUPLICATE EDIT SKIPPED: You already made this exact edit to {path}. "
+                        f"The file was already updated. Move on to the next task or verify the fix works.",
+                        {"success": True, "skipped": True, "reason": "duplicate"},
+                        tool_name,
+                        args
+                    )
+                
+                # Add to completed edits BEFORE executing (to prevent race conditions)
+                completed_edits.add(edit_signature)
+
+            # Execute tool
+            from prometheus.services.tool_registry import get_registry
+            registry = get_registry()
+            translated_workspace = translate_host_path_to_container(
+                request.workspace_path or settings.workspace_path
+            )
+            result = await registry.execute_tool(
+                name=tool_name,
+                args=args,
+                context={"workspace_path": translated_workspace, "mcp_tools": mcp_tools},
+            )
+
+            logger.info("Tool execution result", tool=tool_name, success=result.get("success", False))
+
+            # Format result text for model
+            result_text = f"Tool {tool_name} executed successfully." if result.get("success") else f"Tool {tool_name} failed."
+
+            if result.get("items"):
+                items = result.get("items", [])
+                result_text += f"\n\nDirectory listing ({len(items)} items):\n"
+                for item in items[:50]:
+                    item_type = "📁" if item.get("type") == "directory" else "📄"
+                    result_text += f"{item_type} {item.get('name')}\n"
+                if len(items) > 50:
+                    result_text += f"... and {len(items) - 50} more items"
+
+            # Format grep results
+            if result.get("matches") is not None and tool_name == "grep":
+                matches = result.get("matches", [])
+                files_with_matches = result.get("files_with_matches", 0)
+                total_matches = result.get("total_matches", 0)
+                files_searched = result.get("files_searched", 0)
+
+                result_text += f"\n\nGrep Results:"
+                result_text += f"\n- Pattern: {result.get('pattern')}"
+                result_text += f"\n- Searched: {files_searched} files"
+                result_text += f"\n- Found: {total_matches} matches in {files_with_matches} files"
+
+                if matches:
+                    result_text += f"\n\nMatches:\n"
+                    for file_match in matches[:20]:  # Limit to first 20 files
+                        file_path = file_match.get("file")
+                        match_count = file_match.get("match_count", 0)
+                        result_text += f"\n{file_path} ({match_count} matches):\n"
+
+                        if "matches" in file_match:
+                            # Detailed matches with line numbers
+                            for match in file_match["matches"][:10]:  # Limit to first 10 matches per file
+                                line_num = match.get("line_number")
+                                line = match.get("line", "")
+                                result_text += f"  {line_num}: {line}\n"
+
+                            if len(file_match["matches"]) > 10:
+                                result_text += f"  ... and {len(file_match['matches']) - 10} more matches in this file\n"
+
+                    if len(matches) > 20:
+                        result_text += f"\n... and {len(matches) - 20} more files with matches"
+                else:
+                    result_text += f"\n\nNo matches found."
+
+            if result.get("stdout"):
+                result_text += f"\n\nOutput:\n{result.get('stdout')}"
+            if result.get("stderr"):
+                result_text += f"\n\nErrors:\n{result.get('stderr')}"
+            if result.get("content"):
+                content = result.get("content", "")
+                result_text += f"\n\n🎯 ENTIRE FILE CONTENT BELOW - DO NOT READ AGAIN! START EDITING NOW! 🎯\n"
+                result_text += f"File content ({len(content)} chars total):\n{content[:2000]}"
+                if len(content) > 2000:
+                    result_text += f"\n... (truncated for display, but you have the COMPLETE file)"
+                result_text += f"\n\n✅ You now have the FULL file. Do NOT call filesystem_read again!"
+                result_text += f"\n✅ Next step: Use filesystem_replace_lines, filesystem_search_replace, or filesystem_insert to make changes!"
+            if result.get("error"):
+                result_text += f"\n\nError: {result.get('error')}"
+            if result.get("hint"):
+                result_text += f"\n\nHint: {result.get('hint')}"
+            if result.get("message"):
+                result_text += f"\n\n{result.get('message')}"
+
+            return result_text, result, tool_name, args
 
         try:
             while iteration < max_iterations:
@@ -385,18 +575,44 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
                 accumulated_reasoning = ""
                 reasoning_complete = False
                 tool_calls_found = []
+                tool_results = []  # Collect results for conversation continuation
+                last_streamed_pos = 0  # Track what we've already streamed to frontend
+                processed_tool_signatures = set()  # Track already processed tool calls
 
                 # Detect if this is a reasoning model (streams thinking separately from content)
-                model_is_reasoning = model_is_reasoning(request.model)
+                model_is_reasoning = is_reasoning_model(request.model)
+                is_ollama_reasoning = model_is_reasoning and "ollama" in request.model.lower()
 
-                logger.info("Starting model stream", iteration=iteration, message_count=len(current_messages), model_is_reasoning=model_is_reasoning)
+                logger.info("Starting model stream", iteration=iteration, message_count=len(current_messages), model_is_reasoning=model_is_reasoning, is_ollama_reasoning=is_ollama_reasoning)
 
-                # Stream model response - buffer entire response to prevent tool JSON from leaking
+                # Stream iteration progress to frontend
+                progress_data = json.dumps({
+                    "iteration_progress": {
+                        "current": iteration,
+                        "max": max_iterations,
+                        "message_count": len(current_messages),
+                        "read_ops": read_only_operations,
+                        "edit_ops": edit_operations
+                    }
+                })
+                yield f"data: {progress_data}\n\n"
+
+                # Stream model response with SMART BUFFERING to hide tool call JSON
+                stream_buffer = ""  # Buffer for potentially unsafe content
+                safe_to_stream_pos = 0  # Position in accumulated_response that's been streamed
+                in_potential_json = False  # Whether we're inside potential JSON
+                brace_depth = 0  # Track { } depth
+
+                # For Ollama reasoning models, track <think> tags
+                in_think_tag = False  # Whether we're inside <think>...</think>
+                think_buffer = ""  # Buffer for thinking content
+                pending_content = ""  # Content that might be part of opening/closing tag
+
                 async for chunk in model_router.stream(
                     model=request.model,
                     messages=current_messages,
                     api_base=request.api_base,
-                    api_key=api_key_to_use,  # Use the determined API key
+                    api_key=api_key_to_use,
                 ):
                     if chunk.choices and chunk.choices[0].delta:
                         delta = chunk.choices[0].delta
@@ -406,7 +622,6 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
                             reasoning_chunk = delta.provider_specific_fields.get("reasoning_content", "")
                             if reasoning_chunk:
                                 accumulated_reasoning += reasoning_chunk
-                                # Stream thinking chunk to frontend
                                 thinking_data = json.dumps({"thinking_chunk": reasoning_chunk})
                                 yield f"data: {thinking_data}\n\n"
 
@@ -414,10 +629,83 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
                         if delta.content:
                             content = delta.content
 
-                            # If we have reasoning and this is the first regular content, send thinking_complete
-                            if accumulated_reasoning and not reasoning_complete:
+                            # For Ollama reasoning models, detect <think> tags in content
+                            content_added_to_buffer = ""  # Track what we add to stream_buffer for brace tracking
+                            if is_ollama_reasoning:
+                                pending_content += content
+
+                                # Process pending content for <think> tags
+                                while pending_content:
+                                    if not in_think_tag:
+                                        # Look for opening <think> tag
+                                        think_start = pending_content.find("<think>")
+                                        if think_start != -1:
+                                            # Content before <think> goes to regular response
+                                            before_think = pending_content[:think_start]
+                                            if before_think:
+                                                accumulated_response += before_think
+                                                stream_buffer += before_think
+                                                content_added_to_buffer += before_think
+
+                                            in_think_tag = True
+                                            pending_content = pending_content[think_start + 7:]  # Skip <think>
+                                            logger.info("Entered <think> tag")
+                                        elif "<think" in pending_content and len(pending_content) < 10:
+                                            # Might be partial tag, wait for more content
+                                            break
+                                        else:
+                                            # No <think> tag, this is regular content
+                                            accumulated_response += pending_content
+                                            stream_buffer += pending_content
+                                            content_added_to_buffer += pending_content
+                                            pending_content = ""
+                                    else:
+                                        # Inside <think> tag, look for closing </think>
+                                        think_end = pending_content.find("</think>")
+                                        if think_end != -1:
+                                            # Thinking content before </think>
+                                            thinking_chunk = pending_content[:think_end]
+                                            if thinking_chunk:
+                                                accumulated_reasoning += thinking_chunk
+                                                think_buffer += thinking_chunk
+                                                # Stream thinking to frontend
+                                                thinking_data = json.dumps({"thinking_chunk": thinking_chunk})
+                                                yield f"data: {thinking_data}\n\n"
+
+                                            in_think_tag = False
+                                            pending_content = pending_content[think_end + 8:]  # Skip </think>
+                                            logger.info("Exited </think> tag", reasoning_length=len(accumulated_reasoning))
+
+                                            # Send thinking_complete if we have reasoning and are transitioning to content
+                                            if accumulated_reasoning and not reasoning_complete and pending_content.strip():
+                                                reasoning_complete = True
+                                                summary = accumulated_reasoning[:100] + "..." if len(accumulated_reasoning) > 100 else accumulated_reasoning
+                                                complete_data = json.dumps({
+                                                    "thinking_complete": {
+                                                        "summary": summary,
+                                                        "full_content": accumulated_reasoning
+                                                    }
+                                                })
+                                                yield f"data: {complete_data}\n\n"
+                                                logger.info("Thinking complete (Ollama)", reasoning_length=len(accumulated_reasoning))
+                                        elif "</think" in pending_content and len(pending_content) < 10:
+                                            # Might be partial closing tag, wait for more content
+                                            break
+                                        else:
+                                            # Still inside thinking, accumulate it
+                                            accumulated_reasoning += pending_content
+                                            think_buffer += pending_content
+                                            # Stream thinking to frontend
+                                            thinking_data = json.dumps({"thinking_chunk": pending_content})
+                                            yield f"data: {thinking_data}\n\n"
+                                            pending_content = ""
+
+                                # Use content_added_to_buffer for brace tracking instead of original content
+                                content = content_added_to_buffer
+
+                            # If we have reasoning and this is the first regular content, send thinking_complete (for API models)
+                            if content and accumulated_reasoning and not reasoning_complete:
                                 reasoning_complete = True
-                                # Generate summary (first 100 chars)
                                 summary = accumulated_reasoning[:100] + "..." if len(accumulated_reasoning) > 100 else accumulated_reasoning
                                 complete_data = json.dumps({
                                     "thinking_complete": {
@@ -428,197 +716,423 @@ Remember: Be helpful, be concise, and continue making tool calls until the task 
                                 yield f"data: {complete_data}\n\n"
                                 logger.info("Thinking complete, transitioning to response", reasoning_length=len(accumulated_reasoning))
 
-                            accumulated_response += content
+                            if content:
+                                accumulated_response += content
+                                stream_buffer += content
 
-                            # Stream content immediately for reasoning models (they don't use tools)
-                            # Buffer for regular models to extract/strip tool calls
-                            if model_is_reasoning:
-                                token_data = json.dumps({"token": content})
-                                yield f"data: {token_data}\n\n"
+                            # Track brace depth to detect JSON blocks
+                            for char in content:
+                                if char == '{':
+                                    brace_depth += 1
+                                    if brace_depth == 1:
+                                        in_potential_json = True
+                                elif char == '}':
+                                    brace_depth = max(0, brace_depth - 1)
+                                    if brace_depth == 0:
+                                        in_potential_json = False
 
-                # Extract tool calls ONCE after streaming completes (not on every chunk!)
-                tool_calls = extract_tool_calls(accumulated_response)
+                            # SMART STREAMING STRATEGY:
+                            # 1. If not in JSON and buffer has content, check for complete tool calls
+                            # 2. Stream safe content (everything before tool calls)
+                            # 3. Hold back potential JSON until we confirm it's a tool call or not
 
-                # Track tool calls
-                for tool_call, start, end in tool_calls:
-                    tool_signature = json.dumps(tool_call, sort_keys=True)
-                    if not any(tc["signature"] == tool_signature for tc in tool_calls_found):
-                        tool_calls_found.append({
-                            "call": tool_call,
-                            "start": start,
-                            "end": end,
-                            "signature": tool_signature
-                        })
+                            if not in_potential_json or brace_depth == 0:
+                                # We're outside JSON or just closed a brace - safe to check for tools
+                                tool_calls = extract_tool_calls(accumulated_response)
 
-                        # Send tool call notification to frontend for animation
-                        tool_call_notification = json.dumps({
-                            "tool_call": {
-                                "tool": tool_call.get("tool"),
-                                "args": tool_call.get("args"),
-                            }
-                        })
-                        yield f"data: {tool_call_notification}\n\n"
+                                # Calculate what's safe to stream (everything up to first unprocessed tool call)
+                                safe_end = len(accumulated_response)
+                                for tool_call, start, end in tool_calls:
+                                    tool_signature = json.dumps(tool_call, sort_keys=True)
+                                    if tool_signature not in processed_tool_signatures:
+                                        # Found new tool call - can only stream up to its start
+                                        safe_end = min(safe_end, start)
+                                        break
 
-                # Strip tool calls from the complete response
+                                # Stream safe content
+                                if safe_end > safe_to_stream_pos:
+                                    safe_content = accumulated_response[safe_to_stream_pos:safe_end]
+                                    if safe_content.strip():
+                                        token_data = json.dumps({"token": safe_content})
+                                        yield f"data: {token_data}\n\n"
+                                    safe_to_stream_pos = safe_end
+                                    stream_buffer = accumulated_response[safe_to_stream_pos:]
+
+                                # Process any new tool calls found
+                                for tool_call, start, end in tool_calls:
+                                    tool_signature = json.dumps(tool_call, sort_keys=True)
+
+                                    # Skip if already processed
+                                    if tool_signature in processed_tool_signatures:
+                                        continue
+
+                                    processed_tool_signatures.add(tool_signature)
+                                    safe_to_stream_pos = end  # Skip over the tool call JSON
+                                    stream_buffer = accumulated_response[safe_to_stream_pos:]
+
+                                    # Send tool call notification IMMEDIATELY
+                                    tool_call_notification = json.dumps({
+                                        "tool_call": {
+                                            "tool": tool_call.get("tool"),
+                                            "args": tool_call.get("args"),
+                                        }
+                                    })
+                                    yield f"data: {tool_call_notification}\n\n"
+                                    logger.info("Tool call detected during stream", tool=tool_call.get("tool"))
+
+                                    # Execute tool IMMEDIATELY
+                                    result_text, result, tool_name, args = await execute_and_yield_tool(tool_call)
+
+                                    # Check if permission required
+                                    if result.get("permission_required"):
+                                        permission_data = json.dumps({
+                                            "permission_request": {
+                                                "command": result.get("command"),
+                                                "full_command": result.get("full_command"),
+                                                "tool": tool_name,
+                                                "message": result.get("message"),
+                                            }
+                                        })
+                                        yield f"data: {permission_data}\n\n"
+                                        tool_results.append({
+                                            "tool": tool_name,
+                                            "result": f"⚠️ Permission required to run command: {result.get('command')}\n\nThis command needs your approval before it can be executed.",
+                                        })
+                                        continue
+
+                                    # Send tool execution result to frontend IMMEDIATELY
+                                    tool_data = json.dumps({
+                                        "tool_execution": {
+                                            "tool": tool_name,
+                                            "args": args,
+                                            "success": result.get("success", False),
+                                            "path": result.get("path"),
+                                            "file": result.get("file"),
+                                            "command": result.get("command"),
+                                            "action": result.get("action"),
+                                            "stdout": result.get("stdout"),
+                                            "stderr": result.get("stderr"),
+                                            "content": result.get("content"),
+                                            "diff": result.get("diff"),
+                                            "error": result.get("error"),
+                                            "return_code": result.get("return_code"),
+                                            "hint": result.get("hint")
+                                        }
+                                    })
+                                    yield f"data: {tool_data}\n\n"
+
+                                    tool_calls_found.append({
+                                        "call": tool_call,
+                                        "signature": tool_signature
+                                    })
+                                    tool_results.append({
+                                        "tool": tool_name,
+                                        "result": result_text
+                                    })
+
+                            # If buffer gets too large and we're confident it's not a tool call, stream it
+                            elif len(stream_buffer) > 200:
+                                # Check for any tool-like patterns before streaming
+                                tool_patterns = ['"tool"', "'tool'", "tool:", "{", "filesystem_", "shell_", "python_"]
+                                has_tool_pattern = any(p in stream_buffer for p in tool_patterns)
+
+                                if not has_tool_pattern:
+                                    # No tool patterns at all - safe to stream everything except last 50 chars
+                                    safe_amount = len(stream_buffer) - 50
+                                    if safe_amount > 0:
+                                        safe_content = stream_buffer[:safe_amount]
+                                        token_data = json.dumps({"token": safe_content})
+                                        yield f"data: {token_data}\n\n"
+                                        safe_to_stream_pos += safe_amount
+                                        stream_buffer = stream_buffer[safe_amount:]
+                                elif brace_depth == 0 and '{' not in stream_buffer[-100:]:
+                                    # Braces are balanced and no recent brace - safe to stream older content
+                                    # Find the last occurrence of potential tool pattern
+                                    last_tool_idx = -1
+                                    for pattern in ['"tool"', "'tool'", '{"', '{']:
+                                        idx = stream_buffer.rfind(pattern)
+                                        if idx > last_tool_idx:
+                                            last_tool_idx = idx
+
+                                    if last_tool_idx > 0:
+                                        # Only stream content before the last tool-like pattern
+                                        safe_content = stream_buffer[:last_tool_idx]
+                                        if safe_content.strip():
+                                            token_data = json.dumps({"token": safe_content})
+                                            yield f"data: {token_data}\n\n"
+                                            safe_to_stream_pos += len(safe_content)
+                                            stream_buffer = stream_buffer[len(safe_content):]
+
+                # Handle any remaining pending content for Ollama reasoning models
+                if is_ollama_reasoning and (pending_content or in_think_tag):
+                    # If we ended while inside thinking, send the remaining as thinking and complete it
+                    if in_think_tag:
+                        if pending_content:
+                            accumulated_reasoning += pending_content
+                            thinking_data = json.dumps({"thinking_chunk": pending_content})
+                            yield f"data: {thinking_data}\n\n"
+
+                        # Send thinking_complete
+                        if accumulated_reasoning and not reasoning_complete:
+                            reasoning_complete = True
+                            summary = accumulated_reasoning[:100] + "..." if len(accumulated_reasoning) > 100 else accumulated_reasoning
+                            complete_data = json.dumps({
+                                "thinking_complete": {
+                                    "summary": summary,
+                                    "full_content": accumulated_reasoning
+                                }
+                            })
+                            yield f"data: {complete_data}\n\n"
+                            logger.info("Thinking complete (end of stream)", reasoning_length=len(accumulated_reasoning))
+                    else:
+                        # Not in think tag, treat remaining as regular content
+                        if pending_content:
+                            accumulated_response += pending_content
+                            stream_buffer += pending_content
+
+                # After streaming completes, stream any remaining buffered content
+                # (strip out any tool calls that might be in the buffer)
+                if stream_buffer.strip():
+                    # Check one final time for tool calls in the buffer
+                    final_tool_calls = extract_tool_calls(accumulated_response)
+                    buffer_start_pos = len(accumulated_response) - len(stream_buffer)
+
+                    # Find if there are any tool calls in the buffer range
+                    has_tool_in_buffer = False
+                    tool_ranges = []  # Track ranges to exclude
+                    for tool_call, start, end in final_tool_calls:
+                        if start >= buffer_start_pos:
+                            has_tool_in_buffer = True
+                            tool_ranges.append((start - buffer_start_pos, end - buffer_start_pos))
+
+                    if has_tool_in_buffer:
+                        # Extract only the non-tool parts of the buffer
+                        clean_parts = []
+                        pos = 0
+                        for tool_start, tool_end in sorted(tool_ranges):
+                            if pos < tool_start:
+                                clean_parts.append(stream_buffer[pos:tool_start])
+                            pos = tool_end
+                        if pos < len(stream_buffer):
+                            clean_parts.append(stream_buffer[pos:])
+
+                        clean_buffer = "".join(clean_parts).strip()
+                    else:
+                        # No tool calls - but still check for partial tool patterns
+                        clean_buffer = stream_buffer.strip()
+
+                        # Remove any obvious tool JSON patterns that weren't detected as complete
+                        # Match partial tool call patterns: {"tool... or { "tool...
+                        partial_pattern = r'\{\s*"tool"?\s*:?\s*[^}]*$'
+                        clean_buffer = re.sub(partial_pattern, '', clean_buffer, flags=re.DOTALL)
+
+                    if clean_buffer and clean_buffer.strip():
+                        token_data = json.dumps({"token": clean_buffer.strip()})
+                        yield f"data: {token_data}\n\n"
+
+                # Get clean response for conversation history
                 clean_response = strip_tool_calls(accumulated_response)
 
-                # Send the clean response (all at once, after stripping tool calls)
-                # Skip this for reasoning models since we already streamed the content
-                if clean_response.strip() and not model_is_reasoning:
-                    final_data = json.dumps({"token": clean_response})
-                    yield f"data: {final_data}\n\n"
-                
                 # Add assistant response to conversation (without tool calls)
                 if clean_response.strip():
                     current_messages.append({
                         "role": "assistant",
                         "content": clean_response.strip()
                     })
+
+                # Add tool results to conversation if any tools were executed during streaming
+                if tool_results:
+                    # Reset consecutive lazy kicks since the model actually did something
+                    consecutive_lazy_kicks = 0
+                    
+                    # Track read vs edit operations
+                    read_tools = {'filesystem_read', 'grep', 'filesystem_list', 'filesystem_search'}
+                    edit_tools = {'filesystem_write', 'filesystem_replace_lines', 'filesystem_insert', 
+                                  'filesystem_search_replace', 'filesystem_delete', 'shell_execute', 'run_python'}
+                    
+                    for tr in tool_results:
+                        tool_name = tr.get('tool', '')
+                        if tool_name in read_tools:
+                            read_only_operations += 1
+                            task_started = True
+                        elif tool_name in edit_tools:
+                            edit_operations += 1
+                            task_started = True
+                            # Reset read counter when an edit is made
+                            read_only_operations = 0
+                    
+                    tool_result_message = "Tool execution results:\n"
+                    for tr in tool_results:
+                        tool_result_message += f"\n{tr['tool']}: {tr['result']}\n"
+                    
+                    # HARD BLOCK: After too many reads, refuse to show results and force edit
+                    if read_only_operations >= max_reads_before_block and edit_operations == 0:
+                        tool_result_message = f"""
+🛑 BLOCKED! {read_only_operations} READS WITH ZERO EDITS!
+
+FURTHER READ RESULTS HIDDEN. You have seen enough.
+
+You MUST output an edit tool call NOW. Pick one:
+
+1. filesystem_replace_lines - Replace specific line range
+   {{"tool": "filesystem_replace_lines", "args": {{"path": "file.py", "start_line": N, "end_line": M, "replacement": "fixed code"}}}}
+
+2. filesystem_search_replace - Find and replace text
+   {{"tool": "filesystem_search_replace", "args": {{"path": "file.py", "search": "broken", "replace": "fixed"}}}}
+
+If you don't know what to fix, make your BEST GUESS based on the error message and the code you've seen.
+
+🚫 Any further read/grep calls will return BLOCKED.
+✅ Only edit tools will work now.
+
+OUTPUT THE EDIT TOOL CALL. NOTHING ELSE."""
+                        logger.warning("Agent BLOCKED from more reads, forcing edit", 
+                                      read_ops=read_only_operations, edit_ops=edit_operations)
+                    
+                    # Nudge agent if stuck in analysis paralysis (many reads, no edits)
+                    elif read_only_operations >= max_reads_before_nudge and edit_operations == 0:
+                        nudge_message = f"""
+
+⚠️ MANDATORY ACTION REQUIRED ⚠️
+
+You've done {read_only_operations} read operations. That's ENOUGH analysis.
+
+RULES:
+1. Your NEXT output MUST be an EDIT tool call - NOT another read.
+2. If you output another read/grep, it will be BLOCKED.
+3. Use the file content you already have to make the fix NOW.
+
+REQUIRED OUTPUT FORMAT (choose one):
+
+{{"tool": "filesystem_replace_lines", "args": {{"path": "FILE", "start_line": N, "end_line": M, "replacement": "FIXED CODE"}}}}
+
+{{"tool": "filesystem_search_replace", "args": {{"path": "FILE", "search": "BROKEN CODE", "replace": "FIXED CODE"}}}}
+
+DO IT NOW. No more reading. No more explaining. Just the tool call."""
+                        tool_result_message += nudge_message
+                        logger.warning("Agent stuck in analysis paralysis, nudging to take action", 
+                                      read_ops=read_only_operations, edit_ops=edit_operations)
+
+                    current_messages.append({
+                        "role": "user",
+                        "content": tool_result_message
+                    })
+
+                    logger.info("Added tool results to conversation", result_count=len(tool_results), 
+                               read_ops=read_only_operations, edit_ops=edit_operations)
+
+                    # Check if we need to compress after adding tool results
+                    current_messages, updated_context_info = await check_and_compress_if_needed(
+                        messages=current_messages,
+                        model=request.model,
+                        auto_compress=True
+                    )
+
+                    # If compression occurred, notify frontend
+                    if updated_context_info.get("compressed"):
+                        logger.info("Compressed during multi-turn loop", **updated_context_info)
+                        compression_notification = json.dumps({"context_info": updated_context_info})
+                        yield f"data: {compression_notification}\n\n"
+
+                    # Continue loop to get model's next response
+                    continue
                 
-                # Execute any tool calls found
-                if tool_calls_found:
-                    logger.info("Executing tool calls", count=len(tool_calls_found))
-                    
-                    # Collect all tool results
-                    tool_results = []
-                    
-                    for tool_info in tool_calls_found:
-                        tool_call = tool_info["call"]
-                        tool_name = tool_call.get("tool")
-                        args = tool_call.get("args", {})
-                        
-                        logger.info("Executing tool", tool=tool_name, args=args)
-                        
-                        # Execute tool
-                        from prometheus.services.tool_registry import get_registry
-                        registry = get_registry()
-                        # Translate workspace path for Docker container
-                        translated_workspace = translate_host_path_to_container(
-                            request.workspace_path or settings.workspace_path
-                        )
-                        result = await registry.execute_tool(
-                            name=tool_name,
-                            args=args,
-                            context={"workspace_path": translated_workspace, "mcp_tools": mcp_tools},
-                        )
-                        
-                        logger.info("Tool execution result", tool=tool_name, success=result.get("success", False))
-                        
-                        # Check if tool requires permission
-                        if result.get("permission_required"):
-                            # Send permission request to frontend
-                            permission_data = json.dumps({
-                                "permission_request": {
-                                    "command": result.get("command"),
-                                    "full_command": result.get("full_command"),
-                                    "tool": tool_name,
-                                    "message": result.get("message"),
-                                }
-                            })
-                            yield f"data: {permission_data}\n\n"
-                            
-                            # Stop execution and wait for user to approve
-                            # The conversation will pause here until user approves the command
-                            # and sends a new message
-                            logger.info("Tool execution requires permission", tool=tool_name, command=result.get("command"))
-                            tool_results.append({
-                                "tool": tool_name,
-                                "result": f"⚠️ Permission required to run command: {result.get('command')}\n\nThis command needs your approval before it can be executed. Please approve or deny this command to continue.",
-                            })
-                            continue
-                        
-                        # Send tool execution result to frontend
-                        if result:
-                            tool_data = json.dumps({
-                                "tool_execution": {
-                                    "tool": tool_name,
-                                    "success": result.get("success", False),
-                                    "path": result.get("path"),
-                                    "file": result.get("file"),
-                                    "command": result.get("command"),
-                                    "action": result.get("action"),
-                                    "stdout": result.get("stdout"),
-                                    "stderr": result.get("stderr"),
-                                    "content": result.get("content"),
-                                    "error": result.get("error"),
-                                    "return_code": result.get("return_code"),
-                                    "hint": result.get("hint")
-                                }
-                            })
-                            yield f"data: {tool_data}\n\n"
-                        
-                        # Format tool result for model
-                        if result:
-                            result_text = f"Tool {tool_name} executed successfully." if result.get("success") else f"Tool {tool_name} failed."
-                            
-                            # Handle different result types
-                            if result.get("items"):
-                                # filesystem_list returns items
-                                items = result.get("items", [])
-                                result_text += f"\n\nDirectory listing ({len(items)} items):\n"
-                                for item in items[:50]:  # Limit to 50 items
-                                    item_type = "📁" if item.get("type") == "directory" else "📄"
-                                    result_text += f"{item_type} {item.get('name')}\n"
-                                if len(items) > 50:
-                                    result_text += f"... and {len(items) - 50} more items"
-                            
-                            if result.get("stdout"):
-                                result_text += f"\n\nOutput:\n{result.get('stdout')}"
-                            if result.get("stderr"):
-                                result_text += f"\n\nErrors:\n{result.get('stderr')}"
-                            if result.get("content"):
-                                content = result.get("content", "")
-                                result_text += f"\n\nFile content:\n{content[:2000]}"  # Limit length
-                                if len(content) > 2000:
-                                    result_text += f"\n... (truncated, {len(content)} total chars)"
-                            if result.get("error"):
-                                result_text += f"\n\nError: {result.get('error')}"
-                            if result.get("hint"):
-                                result_text += f"\n\nHint: {result.get('hint')}"
-                            if result.get("message"):
-                                result_text += f"\n\n{result.get('message')}"
-                            
-                            tool_results.append({
-                                "tool": tool_name,
-                                "result": result_text
-                            })
-                    
-                    # Add tool results to conversation so model can continue
-                    if tool_results:
-                        tool_result_message = "Tool execution results:\n"
-                        for tr in tool_results:
-                            tool_result_message += f"\n{tr['tool']}: {tr['result']}\n"
+                # No tool calls found - check if model is truly done or just being lazy
+                lazy_patterns = [
+                    "I'll ", "I will ", "Let me ", "I'm going to ", "I need to ",
+                    "First, let me", "First I'll", "Now I'll", "Next I'll",
+                    "I should ", "I can ", "I want to ", "I would like to ",
+                    "Let's ", "We need to ", "We should ",
+                ]
+                response_lower = clean_response.strip().lower()
+                response_text = clean_response.strip()
 
-                        current_messages.append({
-                            "role": "user",
-                            "content": tool_result_message
-                        })
-
-                        logger.info("Added tool results to conversation", result_count=len(tool_results))
-
-                        # Check if we need to compress after adding tool results
-                        current_messages, updated_context_info = await check_and_compress_if_needed(
-                            messages=current_messages,
-                            model=request.model,
-                            auto_compress=True
-                        )
-
-                        # If compression occurred, notify frontend
-                        if updated_context_info.get("compressed"):
-                            logger.info("Compressed during multi-turn loop", **updated_context_info)
-                            compression_notification = json.dumps({"context_info": updated_context_info})
-                            yield f"data: {compression_notification}\n\n"
-
-                        # Continue loop to get model's next response
-                        continue
+                # Check if response ends with lazy intent but no action
+                is_lazy = any(pattern.lower() in response_lower for pattern in lazy_patterns)
+                ends_with_colon = response_text.rstrip().endswith(':')
                 
-                # No tool calls found - model is done
-                logger.info("No tool calls found, conversation complete")
+                # Only check the last 500 chars for lazy patterns (not the whole response)
+                last_part = response_text[-500:] if len(response_text) > 500 else response_text
+                is_lazy_ending = any(pattern.lower() in last_part.lower() for pattern in lazy_patterns)
+
+                if (is_lazy_ending or ends_with_colon) and consecutive_lazy_kicks < max_lazy_kicks:
+                    # Agent said it would do something but didn't - kick it to continue
+                    lazy_kick_count += 1
+                    consecutive_lazy_kicks += 1
+                    logger.warning("Detected lazy response without tool call, forcing continuation",
+                                   text_preview=response_text[:100], kick_count=lazy_kick_count, consecutive=consecutive_lazy_kicks)
+
+                    kick_message = """🚨 STOP! You said you would do something but didn't actually do it!
+
+Your last message ended with an intent like "I'll..." or "Let me..." but you didn't output any tool call.
+
+YOU MUST OUTPUT A TOOL CALL RIGHT NOW. Do not explain, do not describe - just output the JSON:
+{"tool": "...", "args": {...}}
+
+If you were going to read a file, READ IT NOW.
+If you were going to edit a file, EDIT IT NOW.
+If you were going to insert code, INSERT IT NOW.
+
+DO NOT RESPOND WITH TEXT. ONLY OUTPUT THE TOOL CALL JSON."""
+
+                    current_messages.append({
+                        "role": "user",
+                        "content": kick_message
+                    })
+
+                    # Continue loop to force the model to actually do something
+                    continue
+
+                if consecutive_lazy_kicks >= max_lazy_kicks:
+                    logger.warning("Max consecutive lazy kicks reached, ending conversation", consecutive=consecutive_lazy_kicks)
+
+                # CRITICAL: Don't stop if we've only been reading and haven't made edits!
+                # This prevents the agent from giving up before completing the task.
+                if edit_operations == 0 and read_only_operations > 0 and iteration < max_iterations - 1:
+                    logger.warning("Agent stopping without making any edits! Forcing continuation.",
+                                  read_ops=read_only_operations, edit_ops=edit_operations)
+                    
+                    force_edit_message = f"""🛑 STOP! You have NOT completed the task!
+
+You've read {read_only_operations} files but made ZERO edits. The user asked you to FIX something, not just analyze it.
+
+Your response talked about what you found, but you MUST now take action.
+
+DO NOT respond with text. Output a tool call to make the fix:
+
+{{"tool": "filesystem_replace_lines", "args": {{"path": "FILENAME", "start_line": X, "end_line": Y, "replacement": "FIXED CODE"}}}}
+
+or
+
+{{"tool": "filesystem_search_replace", "args": {{"path": "FILENAME", "search": "OLD_TEXT", "replace": "NEW_TEXT"}}}}
+
+MAKE THE EDIT NOW. NO MORE EXPLANATIONS."""
+
+                    current_messages.append({
+                        "role": "user", 
+                        "content": force_edit_message
+                    })
+                    continue
+                
+                logger.info("No tool calls found, conversation complete", edit_ops=edit_operations, read_ops=read_only_operations)
                 break
             
+            # Check if we're approaching or hit the limit
+            if iteration >= max_iterations - 5 and iteration < max_iterations:
+                # Warn user we're approaching the limit
+                warning_data = json.dumps({
+                    "iteration_warning": {
+                        "current": iteration,
+                        "max": max_iterations,
+                        "remaining": max_iterations - iteration,
+                        "message": f"Agent is using many iterations ({iteration}/{max_iterations}). Complex task in progress..."
+                    }
+                })
+                yield f"data: {warning_data}\n\n"
+                
             if iteration >= max_iterations:
                 logger.warning("Reached max iterations", max_iterations=max_iterations)
-                yield f"data: {json.dumps({'error': 'Reached maximum iteration limit'})}\n\n"
+                yield f"data: {json.dumps({'error': 'Reached maximum iteration limit', 'iteration': iteration, 'max_iterations': max_iterations})}\n\n"
 
             # Extract and save memories from the conversation
             for msg in request.messages:

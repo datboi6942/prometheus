@@ -17,6 +17,7 @@
 	import GitPanel from '$lib/components/panels/GitPanel.svelte';
 	import DiffViewer from '$lib/components/chat/DiffViewer.svelte';
 	import ThinkingBlock from '$lib/components/chat/ThinkingBlock.svelte';
+	import ToolExecutionCard from '$lib/components/chat/ToolExecutionCard.svelte';
 
 	// Import stores
 	import {
@@ -28,7 +29,7 @@
 		messages, chatInput, isLoading, isConnected, abortController,
 		currentOpenFile, editorHasUnsavedChanges, toolExecutions, activeToolCalls,
 		gitStatus, gitBranches, gitCommits, isGitRepo, githubAuthenticated, githubUser,
-		contextInfo, activeThinking
+		contextInfo, activeThinking, iterationProgress, iterationWarning
 	} from '$lib/stores';
 	
 	// Import API functions
@@ -199,18 +200,19 @@
 		activeDiffAnimations.set(path, animation);
 		activeDiffAnimations = new Map(activeDiffAnimations);
 
-		// Mark complete after 1s, remove after 3s total
+		// Calculate animation duration based on diff size
+		const totalLines = diff?.hunks?.reduce((acc: number, hunk: any) => acc + (hunk.changes?.length || 0), 0) || 0;
+		const animationDuration = Math.min(Math.max(totalLines * 50, 1000), 3000); // 50ms per line, min 1s, max 3s
+
+		// Mark complete after animation finishes - diffs persist until chat is cleared
 		setTimeout(() => {
 			const anim = activeDiffAnimations.get(path);
 			if (anim) {
 				anim.completed = true;
 				activeDiffAnimations = new Map(activeDiffAnimations);
-				setTimeout(() => {
-					activeDiffAnimations.delete(path);
-					activeDiffAnimations = new Map(activeDiffAnimations);
-				}, 2000);
+				// Diffs now persist permanently until /clear command
 			}
-		}, 1000);
+		}, animationDuration);
 	}
 
 	// Debounced save for settings
@@ -612,6 +614,8 @@
 				$messages = [];
 				$toolExecutions = [];
 				$activeToolCalls = [];
+				$iterationProgress = null;
+				$iterationWarning = null;
 				activeCodeAnimations.clear();
 				activeDiffAnimations.clear();
 				$contextInfo = null;
@@ -681,6 +685,73 @@
 
 			default:
 				addLog(`Unknown command: ${cmd}. Type /help for available commands.`);
+		}
+	}
+
+	// Auto-scroll chat messages
+	let chatMessagesContainer: HTMLElement;
+
+	function scrollToBottom(behavior: ScrollBehavior = 'smooth') {
+		if (chatMessagesContainer) {
+			setTimeout(() => {
+				chatMessagesContainer.scrollTo({
+					top: chatMessagesContainer.scrollHeight,
+					behavior
+				});
+			}, 10);
+		}
+	}
+
+	// Auto-scroll when messages or tool calls change
+	$: if ($messages || $activeToolCalls) {
+		scrollToBottom();
+	}
+
+	// Tool call timeout mechanism - remove stuck tool calls after 3 minutes
+	let toolCallTimeouts: Map<string, number> = new Map();
+
+	// Timer for updating elapsed time display on active tool calls
+	let toolCallTickCounter = 0;
+	let toolCallTickInterval: ReturnType<typeof setInterval> | null = null;
+
+	// Start/stop ticker based on active tool calls
+	$: if ($activeToolCalls.length > 0 && !toolCallTickInterval) {
+		toolCallTickInterval = setInterval(() => {
+			toolCallTickCounter++;
+		}, 1000);
+	} else if ($activeToolCalls.length === 0 && toolCallTickInterval) {
+		clearInterval(toolCallTickInterval);
+		toolCallTickInterval = null;
+	}
+
+	function addToolCallTimeout(toolCall: any) {
+		const key = `${toolCall.tool}_${JSON.stringify(toolCall.args)}`;
+		const timeoutId = setTimeout(() => {
+			// Remove stuck tool call after 3 minutes (reasoning models need time to think!)
+			const matchIndex = $activeToolCalls.findIndex(tc =>
+				tc.tool === toolCall.tool &&
+				JSON.stringify(tc.args) === JSON.stringify(toolCall.args)
+			);
+			if (matchIndex !== -1) {
+				console.warn(`Tool call timed out: ${toolCall.tool}`);
+				$activeToolCalls = [
+					...$activeToolCalls.slice(0, matchIndex),
+					...$activeToolCalls.slice(matchIndex + 1)
+				];
+				addLog(`Tool call timed out: ${toolCall.tool} (no response after 3 minutes)`);
+			}
+			toolCallTimeouts.delete(key);
+		}, 180000); // 3 minute timeout (was 30 seconds - too short for large files + reasoning)
+
+		toolCallTimeouts.set(key, timeoutId);
+	}
+
+	function clearToolCallTimeout(toolCall: any) {
+		const key = `${toolCall.tool}_${JSON.stringify(toolCall.args)}`;
+		const timeoutId = toolCallTimeouts.get(key);
+		if (timeoutId) {
+			clearTimeout(timeoutId);
+			toolCallTimeouts.delete(key);
 		}
 	}
 
@@ -774,6 +845,9 @@
 		$chatInput = '';
 		$isLoading = true;
 		$activeToolCalls = []; // Clear any previous active tool calls
+		$toolExecutions = []; // Clear previous tool executions for this message
+		$iterationProgress = null; // Clear iteration progress
+		$iterationWarning = null; // Clear iteration warning
 		
 		if (!$currentConversationId) {
 			await createNewConversation();
@@ -822,30 +896,41 @@
 							// Handle tool call notifications (tool is being called, not yet executed)
 							if (data.tool_call) {
 								console.log('Tool call initiated:', data.tool_call.tool);
-								$activeToolCalls = [...$activeToolCalls, {
+								const toolCall = {
 									tool: data.tool_call.tool,
 									args: data.tool_call.args,
 									timestamp: new Date()
-								}];
+								};
+								$activeToolCalls = [...$activeToolCalls, toolCall];
+								addToolCallTimeout(toolCall);
 							}
 
 							// Handle tool execution notifications (tool execution completed)
 							if (data.tool_execution) {
 								const te = data.tool_execution;
 
-								// Remove first matching tool call (FIFO execution order)
-								const matchIndex = $activeToolCalls.findIndex(tc =>
+								// Remove matching tool call with improved matching logic
+								// Try exact match first, then fallback to tool name only
+								let matchIndex = $activeToolCalls.findIndex(tc =>
 									tc.tool === te.tool &&
 									JSON.stringify(tc.args) === JSON.stringify(te.args || {})
 								);
+
+								// Fallback: match by tool name if args don't match (handles serialization differences)
+								if (matchIndex === -1) {
+									matchIndex = $activeToolCalls.findIndex(tc => tc.tool === te.tool);
+								}
+
 								if (matchIndex !== -1) {
+									const completedToolCall = $activeToolCalls[matchIndex];
+									clearToolCallTimeout(completedToolCall);
 									$activeToolCalls = [
 										...$activeToolCalls.slice(0, matchIndex),
 										...$activeToolCalls.slice(matchIndex + 1)
 									];
 								}
 
-								// Add to tool executions history
+								// Add to tool executions history with full details
 								$toolExecutions = [...$toolExecutions, {
 									type: te.tool || 'unknown',
 									path: te.path || te.file,
@@ -856,20 +941,32 @@
 									timestamp: new Date(),
 									return_code: te.return_code,
 									hint: te.hint,
-									diff: te.diff
+									diff: te.diff,
+									args: te.args || {}
 								}];
 								console.log('Tool executed:', te.tool, te.success ? '✓' : '✗');
 
-								// Smart animation selection for file writes
-								if (te.tool === 'filesystem_write' && te.success && te.path) {
-									if (te.action === 'created' && te.content) {
-										// New file → code animation (existing behavior)
-										console.log('Starting code animation for:', te.path);
-										startCodeAnimation(te.path, te.content);
-									} else if (te.action === 'modified' && te.diff) {
-										// Modified file → diff viewer (new behavior)
-										console.log('Starting diff animation for:', te.path);
-										startDiffAnimation(te.path, te.diff);
+								// Smart animation selection for file operations
+								if (te.success && te.path) {
+									// For filesystem_write
+									if (te.tool === 'filesystem_write') {
+										if (te.action === 'created' && te.content) {
+											// New file → code animation (Python and all others)
+											console.log('Starting code animation for new file:', te.path);
+											startCodeAnimation(te.path, te.content);
+										} else if (te.action === 'modified' && te.diff) {
+											// Modified file → inline diff viewer (Cursor/Claude Code style)
+											console.log('Starting inline diff animation for:', te.path);
+											startDiffAnimation(te.path, te.diff);
+										}
+									}
+
+									// For targeted editing tools - ALWAYS show inline diff (Cursor/Claude Code style)
+									else if (['filesystem_replace_lines', 'filesystem_search_replace', 'filesystem_insert'].includes(te.tool)) {
+										if (te.diff) {
+											console.log('Starting inline diff animation for targeted edit:', te.path);
+											startDiffAnimation(te.path, te.diff);
+										}
 									}
 								}
 							}
@@ -938,10 +1035,28 @@
 								}
 							}
 
+							// Handle iteration progress
+							if (data.iteration_progress) {
+								$iterationProgress = data.iteration_progress;
+								console.log('Iteration progress:', data.iteration_progress);
+							}
+
+							// Handle iteration warning (approaching limit)
+							if (data.iteration_warning) {
+								$iterationWarning = data.iteration_warning;
+								console.warn('Iteration warning:', data.iteration_warning);
+								addLog(`⚠️ ${data.iteration_warning.message}`);
+							}
+
 							// Handle errors
 							if (data.error) {
 								console.error('Stream error:', data.error);
 								addLog(`Error: ${data.error}`);
+								
+								// Check if it's the iteration limit error
+								if (data.error.includes('iteration limit')) {
+									addLog(`ℹ️ Agent hit iteration limit (${data.iteration || '?'}/${data.max_iterations || '50'}). Try breaking down your request into smaller steps.`);
+								}
 							}
 
 							// Handle OpenAI format (fallback)
@@ -1406,7 +1521,7 @@
 			{#if $activeView === 'chat'}
 				<!-- Chat View -->
 				<div class="flex-1 flex flex-col">
-					<div class="flex-1 overflow-y-auto p-6 space-y-4">
+					<div bind:this={chatMessagesContainer} class="flex-1 overflow-y-auto p-6 space-y-4">
 						{#each $messages as msg}
 							<div class="flex gap-3 {msg.role === 'user' ? 'justify-end' : 'justify-start'}">
 								{#if msg.role !== 'user'}
@@ -1443,40 +1558,7 @@
 							</div>
 						{/each}
 						
-						{#if $isLoading}
-							<div class="flex gap-3">
-								<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center">
-									<Loader2 class="w-4 h-4 text-white animate-spin" />
-								</div>
-								<div class="bg-slate-800/50 border border-slate-700/50 rounded-xl p-4">
-									<div class="text-sm text-slate-400">Thinking...</div>
-								</div>
-							</div>
-						{/if}
-
-						<!-- Active Tool Calls (in progress) -->
-						{#each $activeToolCalls as toolCall}
-							<div class="flex gap-3">
-								<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-600 flex items-center justify-center flex-shrink-0">
-									<Loader2 class="w-4 h-4 text-white animate-spin" />
-								</div>
-								<div class="max-w-2xl flex-1 bg-slate-800/50 border border-blue-500/30 rounded-xl p-4">
-									<div class="flex items-center gap-2">
-										<span class="text-xs font-mono text-blue-400">{toolCall.tool}</span>
-										<span class="text-[10px] px-2 py-0.5 rounded bg-blue-500/20 text-blue-300">
-											Executing...
-										</span>
-									</div>
-									{#if $verboseMode}
-										<div class="text-xs text-slate-400 font-mono mt-2">
-											{JSON.stringify(toolCall.args, null, 2)}
-										</div>
-									{/if}
-								</div>
-							</div>
-						{/each}
-
-						<!-- Active Thinking (in progress) -->
+						<!-- Active Thinking (in progress) - show FIRST as it happens before tool calls -->
 						{#if $activeThinking && $activeThinking.isActive}
 							<div class="flex gap-3">
 								<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-blue-600 flex items-center justify-center flex-shrink-0 animate-pulse">
@@ -1489,6 +1571,127 @@
 										isStreaming={true}
 										isExpanded={true}
 									/>
+								</div>
+							</div>
+						{/if}
+
+						<!-- Recent Tool Executions (completed) - show what the agent has done -->
+						{#each $toolExecutions.slice(-10) as execution}
+							<div class="flex gap-3 animate-fadeIn">
+								<div class="w-8 h-8 flex-shrink-0"><!-- Spacer for alignment --></div>
+								<div class="max-w-2xl flex-1">
+									<ToolExecutionCard {execution} isActive={false} />
+								</div>
+							</div>
+						{/each}
+
+						<!-- Active Tool Calls (in progress) - show after completed ones -->
+						{#each $activeToolCalls as toolCall}
+							{@const _ = toolCallTickCounter}
+							<div class="flex gap-3 animate-fadeIn">
+								<div class="w-8 h-8 flex-shrink-0"><!-- Spacer for alignment --></div>
+								<div class="max-w-2xl flex-1">
+									<ToolExecutionCard 
+										execution={{
+											type: toolCall.tool,
+											path: toolCall.args?.path,
+											command: toolCall.args?.command,
+											status: 'pending',
+											timestamp: toolCall.timestamp,
+											args: toolCall.args
+										}} 
+										isActive={true} 
+									/>
+								</div>
+							</div>
+						{/each}
+
+						<!-- Agent Working Banner - Shows during entire agentic loop -->
+						{#if $isLoading}
+							{@const isWarning = $iterationWarning !== null}
+							{@const progressPct = $iterationProgress ? ($iterationProgress.current / $iterationProgress.max) * 100 : 0}
+							<div class="flex gap-3 animate-fadeIn sticky top-0 z-10">
+								<div class="w-8 h-8 rounded-lg bg-gradient-to-br {isWarning ? 'from-red-500 to-orange-600 shadow-red-500/30' : $toolExecutions.length === 0 ? 'from-purple-500 to-blue-600 shadow-purple-500/30' : 'from-amber-500 to-orange-600 shadow-amber-500/30'} flex items-center justify-center shadow-lg">
+									{#if $activeThinking}
+										<Brain class="w-4 h-4 text-white animate-pulse" />
+									{:else if $activeToolCalls.length > 0}
+										<Loader2 class="w-4 h-4 text-white animate-spin" />
+									{:else}
+										<Brain class="w-4 h-4 text-white animate-pulse" />
+									{/if}
+								</div>
+								<div class="max-w-2xl flex-1 bg-gradient-to-br {isWarning ? 'from-red-500/10 to-orange-500/10 border-red-500/30 ring-red-500/20' : $toolExecutions.length === 0 ? 'from-purple-500/10 to-blue-500/10 border-purple-500/30 ring-purple-500/20' : 'from-amber-500/10 to-orange-500/10 border-amber-500/30 ring-amber-500/20'} border rounded-xl p-4 ring-2">
+									<div class="flex items-center justify-between">
+										<div class="flex items-center gap-2">
+											<Loader2 class="w-4 h-4 {isWarning ? 'text-red-400' : $toolExecutions.length === 0 ? 'text-purple-400' : 'text-amber-400'} animate-spin" />
+											<span class="text-sm {isWarning ? 'text-red-300' : $toolExecutions.length === 0 ? 'text-purple-300' : 'text-amber-300'} font-medium">
+												{#if isWarning}
+													⚠️ {$iterationWarning?.message || 'Approaching limit...'}
+												{:else if $activeThinking}
+													🧠 Reasoning...
+												{:else if $activeToolCalls.length > 0}
+													⚡ Executing {$activeToolCalls.length} tool{$activeToolCalls.length > 1 ? 's' : ''}...
+												{:else if $toolExecutions.length === 0}
+													🚀 Processing your request...
+												{:else}
+													🔄 Agent working...
+												{/if}
+											</span>
+										</div>
+										<div class="flex items-center gap-2 flex-wrap">
+											{#if $iterationProgress}
+												<span class="text-[10px] px-2 py-0.5 rounded-full {isWarning ? 'bg-red-500/20 text-red-300' : 'bg-slate-500/20 text-slate-300'} font-mono">
+													Step {$iterationProgress.current}/{$iterationProgress.max}
+												</span>
+												{#if $iterationProgress.read_ops !== undefined && $iterationProgress.read_ops > 0}
+													<span class="text-[10px] px-2 py-0.5 rounded-full {$iterationProgress.read_ops >= 10 ? 'bg-red-500/20 text-red-300' : $iterationProgress.read_ops >= 4 ? 'bg-amber-500/20 text-amber-300' : 'bg-blue-500/20 text-blue-300'}">
+														{$iterationProgress.read_ops >= 10 ? '🛑' : $iterationProgress.read_ops >= 4 ? '⚠️' : '📖'} {$iterationProgress.read_ops} read{$iterationProgress.read_ops > 1 ? 's' : ''}
+													</span>
+												{/if}
+												{#if $iterationProgress.edit_ops !== undefined && $iterationProgress.edit_ops > 0}
+													<span class="text-[10px] px-2 py-0.5 rounded-full bg-green-500/20 text-green-300">
+														✏️ {$iterationProgress.edit_ops} edit{$iterationProgress.edit_ops > 1 ? 's' : ''}
+													</span>
+												{/if}
+											{/if}
+											<span class="text-[10px] px-2 py-0.5 rounded-full {isWarning ? 'bg-red-500/20 text-red-300' : $toolExecutions.length === 0 ? 'bg-purple-500/20 text-purple-300' : 'bg-amber-500/20 text-amber-300'} flex items-center gap-1">
+												<span class="w-1.5 h-1.5 rounded-full {isWarning ? 'bg-red-400' : $toolExecutions.length === 0 ? 'bg-purple-400' : 'bg-amber-400'} animate-ping"></span>
+												Live
+											</span>
+										</div>
+									</div>
+									
+									<!-- Current activity description -->
+									<div class="mt-2 text-xs text-slate-400">
+										{#if $activeThinking}
+											<span class="flex items-center gap-1.5">
+												<span class="w-2 h-2 rounded-full bg-purple-400 animate-pulse"></span>
+												Model is thinking through the problem...
+											</span>
+										{:else if $activeToolCalls.length > 0}
+											<span class="flex items-center gap-1.5">
+												<span class="w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
+												{$activeToolCalls[0]?.tool}: {$activeToolCalls[0]?.args?.path || $activeToolCalls[0]?.args?.pattern || 'processing...'}
+											</span>
+										{:else}
+											<span class="flex items-center gap-1.5">
+												<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+												Preparing next action...
+											</span>
+										{/if}
+									</div>
+									
+									<!-- Progress bar - shows actual progress when we have iteration info -->
+									<div class="mt-3 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+										{#if $iterationProgress && progressPct > 0}
+											<div 
+												class="h-full bg-gradient-to-r {isWarning ? 'from-red-500 to-orange-500' : $toolExecutions.length === 0 ? 'from-purple-500 to-blue-500' : 'from-amber-500 to-orange-500'} transition-all duration-300"
+												style="width: {progressPct}%"
+											></div>
+										{:else}
+											<div class="h-full bg-gradient-to-r {$toolExecutions.length === 0 ? 'from-purple-500 to-blue-500' : 'from-amber-500 to-orange-500'} animate-progress"></div>
+										{/if}
+									</div>
 								</div>
 							</div>
 						{/if}
@@ -1536,6 +1739,10 @@
 										diff={animation.diff}
 										language={animation.language}
 										completed={animation.completed}
+										on:dismiss={(e) => {
+											activeDiffAnimations.delete(e.detail.path);
+											activeDiffAnimations = new Map(activeDiffAnimations);
+										}}
 									/>
 								</div>
 							</div>
@@ -1721,5 +1928,50 @@
 	/* Default code color */
 	:global(.markdown-content pre code) {
 		color: #d4d4d4;
+	}
+
+	/* Custom animations for tool calls and diffs */
+	@keyframes fadeIn {
+		from {
+			opacity: 0;
+			transform: translateY(8px);
+		}
+		to {
+			opacity: 1;
+			transform: translateY(0);
+		}
+	}
+
+	@keyframes progress {
+		0% {
+			width: 0%;
+		}
+		50% {
+			width: 70%;
+		}
+		100% {
+			width: 100%;
+		}
+	}
+
+	@keyframes pulse-subtle {
+		0%, 100% {
+			opacity: 1;
+		}
+		50% {
+			opacity: 0.85;
+		}
+	}
+
+	:global(.animate-fadeIn) {
+		animation: fadeIn 0.3s ease-out;
+	}
+
+	:global(.animate-progress) {
+		animation: progress 2s ease-in-out infinite;
+	}
+
+	:global(.animate-pulse-subtle) {
+		animation: pulse-subtle 2s ease-in-out infinite;
 	}
 </style>

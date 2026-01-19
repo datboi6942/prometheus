@@ -1,0 +1,11 @@
+---
+description: Global project rules for Prometheus
+alwaysApply: true
+---
+# Prometheus Core Directives
+
+- **Model Agnosticism:** Never hardcode provider-specific logic (e.g., Anthropic's `tool_use` or OpenAI's `functions`) outside of the `ModelRouter` class in `backend/core/router.py`.
+- **The Planning Phase:** Before writing code, you MUST generate or update an `IMPLEMENTATION_PLAN.md`. Wait for user approval if the task involves security-sensitive tools.
+- **Thinking vs. Doing:** Use `<thought>` blocks for internal reasoning and planning. Final output should be clean code or structured JSON.
+- **Security Sandbox:** Any shell execution logic must pass through the `SafeShell` validator. Never allow unescaped user input in shell strings.
+- **Context Management:** Use the Model Context Protocol (MCP) for all external tool access. Reference @mcp-docs for schema standards.
