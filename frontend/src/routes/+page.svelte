@@ -21,6 +21,8 @@
 	import DiffViewer from '$lib/components/chat/DiffViewer.svelte';
 	import ThinkingBlock from '$lib/components/chat/ThinkingBlock.svelte';
 	import ToolExecutionCard from '$lib/components/chat/ToolExecutionCard.svelte';
+	import FilePreviewPanel from '$lib/components/chat/FilePreviewPanel.svelte';
+	import ChatMessage from '$lib/components/chat/ChatMessage.svelte';
 	import IndexingProgressBar from '$lib/components/ui/IndexingProgressBar.svelte';
 
 	// Import stores
@@ -192,11 +194,14 @@
 	
 	// Reactive animation - smoothly animate content as it streams in
 	$: if ($activeFilePreview) {
-		livePreviewTargetContent = $activeFilePreview.content;
-		// Start animation if not already running
-		if (!livePreviewAnimationFrame) {
-			animateLivePreview();
+		// CRITICAL FIX: Cancel existing animation before starting new one to prevent multiple concurrent loops
+		if (livePreviewAnimationFrame) {
+			cancelAnimationFrame(livePreviewAnimationFrame);
+			livePreviewAnimationFrame = null;
 		}
+		livePreviewTargetContent = $activeFilePreview.content;
+		// Start new animation
+		animateLivePreview();
 	} else {
 		// Reset when preview is cleared
 		livePreviewDisplayContent = '';
@@ -967,6 +972,7 @@
 			const decoder = new TextDecoder();
 			let currentResponse = '';
 			let lastIteration = 0;  // Track iteration to segment messages
+			let toolsExecutedInIteration = false;  // Track if tools ran in this iteration
 			$messages = [...$messages, { role: 'assistant', content: '', timestamp: new Date() }];
 			
 			while (true) {
@@ -988,14 +994,16 @@
 								$messages = [...$messages];
 							}
 							
-							// Create new message bubble when a new iteration starts (after tools run)
+							// Create new message bubble when a new iteration starts AND tools were executed
+							// This groups parallel tool executions properly without breaking on iteration increment
 							if (data.iteration_progress && data.iteration_progress.current > lastIteration) {
-								// If there's existing content and we're starting a new iteration, create new message
-								if (lastIteration > 0 && currentResponse.trim()) {
+								// Only create new message if tools ran in previous iteration and we have content
+								if (lastIteration > 0 && toolsExecutedInIteration && currentResponse.trim()) {
 									currentResponse = '';
 									$messages = [...$messages, { role: 'assistant', content: '', timestamp: new Date() }];
 								}
 								lastIteration = data.iteration_progress.current;
+								toolsExecutedInIteration = false;  // Reset for new iteration
 							}
 
 							// Handle tool call notifications (tool is being called, not yet executed)
@@ -1015,6 +1023,7 @@
 							// Handle tool execution notifications (tool execution completed)
 							if (data.tool_execution) {
 								const te = data.tool_execution;
+								toolsExecutedInIteration = true;  // Mark that tools ran in this iteration
 
 								// Remove matching tool call with improved matching logic
 								// Try exact match first, then fallback to tool name only
@@ -1176,6 +1185,21 @@
 									bytesWritten: fwp.bytes_written,
 									isComplete: fwp.is_complete
 								};
+							}
+							
+							// Handle file write complete (actual file write confirmed)
+							if (data.file_write_complete) {
+								const fwc = data.file_write_complete;
+								console.log('File write completed:', fwc.path, 'verified:', fwc.verified);
+								// Only clear preview once we confirm the file was actually written
+								if (fwc.success && $activeFilePreview && $activeFilePreview.path === fwc.path) {
+									// Keep preview visible for a moment then clear
+									setTimeout(() => {
+										if ($activeFilePreview && $activeFilePreview.path === fwc.path) {
+											$activeFilePreview = null;
+										}
+									}, 1000);
+								}
 							}
 
 							// Handle iteration warning (approaching limit)
@@ -1689,39 +1713,7 @@
 						{#each combinedTimeline as item}
 							{#if item.type === 'message'}
 								{@const msg = item.data}
-								<div class="flex gap-3 {msg.role === 'user' ? 'justify-end' : 'justify-start'}">
-									{#if msg.role !== 'user'}
-										<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center flex-shrink-0">
-											<Sparkles class="w-4 h-4 text-white" />
-										</div>
-									{/if}
-									<div class="max-w-2xl space-y-2">
-										<!-- Thinking Block (for assistant messages with reasoning) -->
-										{#if msg.thinking && msg.role === 'assistant'}
-											<ThinkingBlock
-												summary={msg.thinking.summary}
-												fullContent={msg.thinking.fullContent}
-												isStreaming={false}
-												isExpanded={false}
-											/>
-										{/if}
-
-										<!-- Message Content -->
-										<div class="{msg.role === 'user' ? 'bg-amber-500/10 border-amber-500/30' : 'bg-slate-800/50 border-slate-700/50'} border rounded-xl p-4">
-											{#if msg.content}
-												<div class="text-sm text-slate-200 leading-relaxed markdown-content">
-													{@html formatMessageContent(msg.content)}
-												</div>
-											{/if}
-											<div class="text-[10px] text-slate-500 mt-2">{msg.timestamp.toLocaleTimeString()}</div>
-										</div>
-									</div>
-									{#if msg.role === 'user'}
-										<div class="w-8 h-8 rounded-lg bg-slate-700 flex items-center justify-center flex-shrink-0">
-											<span class="text-xs font-bold">You</span>
-										</div>
-									{/if}
-								</div>
+								<ChatMessage message={msg} />
 							{:else if item.type === 'tool_execution'}
 								{@const execution = item.data}
 								<div class="flex gap-3 animate-fadeIn">
@@ -1775,33 +1767,38 @@
 						{#if $isLoading}
 							{@const isWarning = $iterationWarning !== null}
 							{@const progressPct = $iterationProgress ? ($iterationProgress.current / $iterationProgress.max) * 100 : 0}
-							<div class="flex gap-3 animate-fadeIn sticky top-0 z-10">
-								<div class="w-8 h-8 rounded-lg bg-gradient-to-br {isWarning ? 'from-red-500 to-orange-600 shadow-red-500/30' : $toolExecutions.length === 0 ? 'from-purple-500 to-blue-600 shadow-purple-500/30' : 'from-amber-500 to-orange-600 shadow-amber-500/30'} flex items-center justify-center shadow-lg">
+							<div class="flex gap-3 animate-fadeIn sticky top-0 z-10 backdrop-blur-sm">
+								<div class="w-8 h-8 rounded-lg bg-gradient-to-br {isWarning ? 'from-red-500 to-orange-600 shadow-red-500/30' : $toolExecutions.length === 0 ? 'from-purple-500 to-blue-600 shadow-purple-500/30' : 'from-amber-500 to-orange-600 shadow-amber-500/30'} flex items-center justify-center shadow-lg animate-pulse">
 									{#if $activeThinking}
-										<Brain class="w-4 h-4 text-white animate-pulse" />
+										<Brain class="w-4 h-4 text-white" />
 									{:else if $activeToolCalls.length > 0}
 										<Loader2 class="w-4 h-4 text-white animate-spin" />
 									{:else}
-										<Brain class="w-4 h-4 text-white animate-pulse" />
+										<Sparkles class="w-4 h-4 text-white" />
 									{/if}
 								</div>
-								<div class="max-w-2xl flex-1 bg-gradient-to-br {isWarning ? 'from-red-500/10 to-orange-500/10 border-red-500/30 ring-red-500/20' : $toolExecutions.length === 0 ? 'from-purple-500/10 to-blue-500/10 border-purple-500/30 ring-purple-500/20' : 'from-amber-500/10 to-orange-500/10 border-amber-500/30 ring-amber-500/20'} border rounded-xl p-4 ring-2">
+								<div class="max-w-2xl flex-1 bg-gradient-to-br {isWarning ? 'from-red-500/10 to-orange-500/10 border-red-500/30 ring-red-500/20 shadow-red-500/10' : $toolExecutions.length === 0 ? 'from-purple-500/10 to-blue-500/10 border-purple-500/30 ring-purple-500/20 shadow-purple-500/10' : 'from-amber-500/10 to-orange-500/10 border-amber-500/30 ring-amber-500/20 shadow-amber-500/10'} border rounded-xl p-4 ring-2 shadow-xl backdrop-blur-sm">
 									<div class="flex items-center justify-between">
-										<div class="flex items-center gap-2">
-											<Loader2 class="w-4 h-4 {isWarning ? 'text-red-400' : $toolExecutions.length === 0 ? 'text-purple-400' : 'text-amber-400'} animate-spin" />
-											<span class="text-sm {isWarning ? 'text-red-300' : $toolExecutions.length === 0 ? 'text-purple-300' : 'text-amber-300'} font-medium">
-												{#if isWarning}
-													⚠️ {$iterationWarning?.message || 'Approaching limit...'}
-												{:else if $activeThinking}
-													🧠 Reasoning...
-												{:else if $activeToolCalls.length > 0}
-													⚡ Executing {$activeToolCalls.length} tool{$activeToolCalls.length > 1 ? 's' : ''}...
-												{:else if $toolExecutions.length === 0}
-													🚀 Processing your request...
-												{:else}
-													🔄 Agent working...
+										<div class="flex items-center gap-3">
+											<Loader2 class="w-5 h-5 {isWarning ? 'text-red-400' : $toolExecutions.length === 0 ? 'text-purple-400' : 'text-amber-400'} animate-spin" />
+											<div class="flex flex-col gap-0.5">
+												<span class="text-sm {isWarning ? 'text-red-300' : $toolExecutions.length === 0 ? 'text-purple-300' : 'text-amber-300'} font-semibold">
+													{#if isWarning}
+														⚠️ {$iterationWarning?.message || 'Approaching limit...'}
+													{:else if $activeThinking}
+														🧠 Reasoning through the problem
+													{:else if $activeToolCalls.length > 0}
+														⚡ Executing {$activeToolCalls.length} tool{$activeToolCalls.length > 1 ? 's' : ''}
+													{:else if $toolExecutions.length === 0}
+														🚀 Processing your request
+													{:else}
+														🔄 Agent working on task
+													{/if}
+												</span>
+												{#if $streamingStatus}
+													<span class="text-[11px] text-slate-400">{$streamingStatus}</span>
 												{/if}
-											</span>
+											</div>
 										</div>
 										<div class="flex items-center gap-2 flex-wrap">
 											{#if $iterationProgress}
@@ -1867,80 +1864,14 @@
 							
 							<!-- Live File Write Preview - Cursor-like typing animation -->
 							{#if $activeFilePreview}
-								{@const displayLines = livePreviewDisplayContent.split('\n')}
-								{@const totalLines = displayLines.length}
-								{@const visibleLines = displayLines.slice(-25)}
-								{@const startLineNum = Math.max(1, totalLines - 24)}
-								<div class="mt-4 flex gap-3 animate-fadeIn">
-									<div class="w-9 h-9 rounded-xl bg-gradient-to-br from-violet-500 via-purple-500 to-fuchsia-500 flex items-center justify-center flex-shrink-0 shadow-lg shadow-purple-500/40 animate-pulse">
-										<FileCode class="w-5 h-5 text-white" />
-									</div>
-									<div class="max-w-4xl flex-1 bg-[#0d1117] border border-purple-500/30 rounded-xl overflow-hidden shadow-2xl shadow-purple-500/10">
-										<!-- macOS-style title bar -->
-										<div class="bg-[#161b22] px-4 py-2.5 border-b border-purple-500/20 flex items-center justify-between">
-											<div class="flex items-center gap-3">
-												<div class="flex gap-2">
-													<span class="w-3 h-3 rounded-full bg-[#ff5f56] shadow-inner"></span>
-													<span class="w-3 h-3 rounded-full bg-[#ffbd2e] shadow-inner"></span>
-													<span class="w-3 h-3 rounded-full bg-[#27ca40] shadow-inner"></span>
-												</div>
-												<div class="flex items-center gap-2 ml-3 pl-3 border-l border-slate-700">
-													<File class="w-3.5 h-3.5 text-purple-400" />
-													<span class="text-xs font-mono text-slate-200 font-medium tracking-tight">{$activeFilePreview.path}</span>
-												</div>
-											</div>
-											<div class="flex items-center gap-3">
-												<span class="text-[10px] font-mono px-2 py-1 rounded-md bg-purple-500/10 text-purple-300 border border-purple-500/20">
-													{$activeFilePreview.language}
-												</span>
-												<div class="flex items-center gap-1.5 px-2 py-1 rounded-md bg-emerald-500/10 border border-emerald-500/20">
-													<span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
-													<span class="text-[10px] text-emerald-300 font-medium">Writing</span>
-												</div>
-											</div>
-										</div>
-										<!-- Code content with line numbers -->
-										<div class="relative overflow-hidden">
-											<div class="overflow-auto max-h-80 scrollbar-thin scrollbar-thumb-purple-500/30 scrollbar-track-transparent" id="live-preview-scroll">
-												<table class="w-full border-collapse">
-													<tbody class="font-mono text-[13px] leading-6">
-														{#each visibleLines as line, i}
-															<tr class="hover:bg-purple-500/5 transition-colors">
-																<td class="text-right pr-4 pl-4 text-slate-600 select-none w-12 border-r border-slate-800 bg-[#0d1117]">
-																	{startLineNum + i}
-																</td>
-																<td class="pl-4 pr-4 text-slate-200 whitespace-pre">
-																	{line}{#if i === visibleLines.length - 1}<span class="inline-block w-[2px] h-[18px] bg-purple-400 animate-cursor-blink ml-[1px] align-middle"></span>{/if}
-																</td>
-															</tr>
-														{/each}
-													</tbody>
-												</table>
-											</div>
-											<!-- Top gradient fade -->
-											<div class="absolute top-0 left-0 right-0 h-6 bg-gradient-to-b from-[#0d1117] to-transparent pointer-events-none"></div>
-										</div>
-										<!-- Status bar -->
-										<div class="bg-[#161b22] px-4 py-2 border-t border-slate-800 flex items-center justify-between">
-											<div class="flex items-center gap-4">
-												<span class="text-[11px] text-slate-500">
-													<span class="text-purple-400 font-medium">{totalLines}</span> lines
-												</span>
-												<span class="text-[11px] text-slate-500">
-													<span class="text-purple-400 font-medium">{livePreviewDisplayContent.length}</span> chars
-												</span>
-											</div>
-											<div class="flex items-center gap-2">
-												<div class="h-1 w-24 bg-slate-800 rounded-full overflow-hidden">
-													<div 
-														class="h-full bg-gradient-to-r from-purple-500 to-fuchsia-500 transition-all duration-300 ease-out"
-														style="width: {Math.min(100, (livePreviewDisplayContent.length / Math.max(1, $activeFilePreview.bytesWritten)) * 100)}%"
-													></div>
-												</div>
-												<span class="text-[10px] text-slate-500">{Math.round($activeFilePreview.bytesWritten / 1024 * 10) / 10} KB</span>
-											</div>
-										</div>
-									</div>
+								<div class="mt-4">
+									<FilePreviewPanel
+										path={$activeFilePreview.path}
+										displayContent={livePreviewDisplayContent}
+										language={$activeFilePreview.language}
+										bytesWritten={$activeFilePreview.bytesWritten}
+										isComplete={$activeFilePreview.isComplete}
+									/>
 								</div>
 							{/if}
 						{/if}
@@ -2014,28 +1945,50 @@
 						<div class="flex gap-3">
 							<textarea 
 								bind:value={$chatInput}
-								on:keydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
-								placeholder="Ask Prometheus anything... (Shift+Enter for new line)"
+								on:keydown={(e) => { 
+									if (e.key === 'Enter' && !e.shiftKey) { 
+										e.preventDefault(); 
+										sendMessage(); 
+									} else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+										e.preventDefault();
+										sendMessage();
+									} else if (e.key === 'Escape') {
+										if ($isLoading) {
+											stopGeneration();
+										}
+									}
+								}}
+								placeholder="Ask Prometheus anything... (↵ Send • Shift+↵ New line • Cmd+↵ Send • Esc Stop)"
 								rows="3"
-								class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 text-sm text-slate-200 outline-none focus:border-amber-500 resize-none"
+								class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 text-sm text-slate-200 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-500/20 resize-none transition-all"
 								disabled={$isLoading}
 							></textarea>
 							{#if $isLoading}
 								<button 
 									on:click={stopGeneration}
-									class="px-4 bg-red-500 hover:bg-red-600 text-white font-bold rounded-lg transition-all"
+									class="px-4 bg-red-500 hover:bg-red-600 text-white font-bold rounded-lg transition-all active:scale-95 flex items-center gap-2"
+									title="Stop generation (Esc)"
 								>
+									<X class="w-4 h-4" />
 									Stop
 								</button>
 							{:else}
 								<button 
 									on:click={sendMessage}
 									disabled={!$chatInput.trim()}
-									class="px-6 bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 disabled:from-slate-700 disabled:to-slate-700 disabled:cursor-not-allowed text-white font-bold rounded-lg transition-all shadow-lg shadow-amber-500/20"
+									class="px-6 bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 disabled:from-slate-700 disabled:to-slate-700 disabled:cursor-not-allowed text-white font-bold rounded-lg transition-all shadow-lg shadow-amber-500/20 active:scale-95 flex items-center gap-2"
+									title="Send message (Enter or Cmd+Enter)"
 								>
+									<Play class="w-4 h-4 fill-current" />
 									Send
 								</button>
 							{/if}
+						</div>
+						<!-- Keyboard hints -->
+						<div class="mt-2 text-[10px] text-slate-500 flex items-center gap-4">
+							<span>💡 <kbd class="px-1.5 py-0.5 bg-slate-800 rounded text-amber-400">Enter</kbd> to send</span>
+							<span><kbd class="px-1.5 py-0.5 bg-slate-800 rounded text-amber-400">Shift+Enter</kbd> for new line</span>
+							<span><kbd class="px-1.5 py-0.5 bg-slate-800 rounded text-amber-400">Esc</kbd> to stop</span>
 						</div>
 					</div>
 				</div>

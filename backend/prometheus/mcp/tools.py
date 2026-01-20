@@ -253,6 +253,9 @@ class MCPTools:
         Returns:
             dict[str, Any]: Operation result with optional diff.
         """
+        import structlog
+        logger = structlog.get_logger()
+        
         try:
             full_path = self._validate_path(path)
             file_existed = full_path.exists()
@@ -272,6 +275,39 @@ class MCPTools:
             # Write new content
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
+            
+            # CRITICAL: Verify file was actually written to disk
+            if not full_path.exists():
+                logger.error("File write failed - file does not exist after write", path=path)
+                return {
+                    "success": False,
+                    "error": f"File write verification failed: {path} does not exist after write operation"
+                }
+            
+            # Verify content was written correctly
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    written_content = f.read()
+                if written_content != content:
+                    logger.error("File write verification failed - content mismatch", 
+                                path=path, 
+                                expected_size=len(content), 
+                                actual_size=len(written_content))
+                    return {
+                        "success": False,
+                        "error": f"File write verification failed: content mismatch (expected {len(content)} bytes, got {len(written_content)} bytes)"
+                    }
+            except Exception as e:
+                logger.error("File write verification read failed", path=path, error=str(e))
+                return {
+                    "success": False,
+                    "error": f"File write verification failed: could not read back file - {str(e)}"
+                }
+            
+            logger.info("File write verified successfully", 
+                       path=path, 
+                       size=len(content), 
+                       action="modified" if file_existed else "created")
 
             result = {
                 "success": True,
@@ -279,6 +315,7 @@ class MCPTools:
                 "size": len(content),
                 "action": "modified" if file_existed else "created",
                 "content": content,  # Include content for frontend animation
+                "verified": True,  # Indicate this write was verified
             }
 
             # Generate diff for modified files
@@ -289,7 +326,8 @@ class MCPTools:
 
             return result
         except Exception as e:
-            return {"error": str(e)}
+            logger.error("File write exception", path=path, error=str(e))
+            return {"success": False, "error": str(e)}
 
     def filesystem_replace_lines(
         self, path: str, start_line: int, end_line: int, replacement: str

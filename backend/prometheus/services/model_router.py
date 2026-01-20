@@ -90,9 +90,11 @@ class ModelRouter:
             extra["api_key"] = api_key
 
         # For DeepSeek Reasoner, enable streaming of reasoning content
-        # Use specific patterns to avoid false positives (e.g., "gptr1-turbo")
+        # Use specific patterns to avoid false positives (e.g., "gpt-r10", "custom-r15")
         model_lower = model.lower()
-        is_reasoning_model = any(x in model_lower for x in ["deepseek-reasoner", "deepseek-r1", "-r1", "/r1"])
+        # Match patterns: ends with -r1, contains /r1/, or deepseek-r1 variants
+        is_reasoning_model = any(x in model_lower for x in ["deepseek-reasoner", "deepseek-r1", "deepseek/r1"]) or \
+                           model_lower.endswith("-r1") or "/r1/" in model_lower or "/r1" in model_lower
         is_deepseek = "deepseek" in model_lower
         
         if is_reasoning_model:
@@ -147,7 +149,9 @@ class ModelRouter:
             
             # Safety limits to prevent runaway streams
             max_chunks = 10000  # Hard limit on chunks
-            max_response_bytes = 32000  # ~8K tokens worth of content
+            # Increase limits for reasoning models - they need space for thinking + tool calls
+            # 128KB = ~32K tokens, enough for 16K reasoning + 16K response
+            max_response_bytes = 128000 if is_reasoning_model else 32000
             accumulated_bytes = 0
             
             while True:

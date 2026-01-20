@@ -410,7 +410,7 @@ NEVER output a single file with 500+ lines - it will timeout and fail!""".format
 
         # Maintain conversation state (use compressed messages)
         current_messages = messages_to_use.copy()
-        max_iterations = 100  # Allow enough iterations to complete complex tasks (large files, multi-step operations)
+        max_iterations = 50  # Blocking logic prevents infinite loops, so 50 iterations is sufficient
         iteration = 0
         lazy_kick_count = 0  # Track how many times we've kicked the agent for being lazy
         max_lazy_kicks = 3  # Don't kick more than 3 times per iteration to avoid infinite loops
@@ -426,6 +426,8 @@ NEVER output a single file with 500+ lines - it will timeout and fail!""".format
         file_read_attempts: dict[str, int] = {}  # Track how many times agent tried to read SAME file
         total_blocked_reads = 0  # Total blocked read attempts across all files
         max_blocked_reads = 10  # Abort conversation after this many blocked reads
+        consecutive_blocked_reads = 0  # Track consecutive blocks without progress
+        max_consecutive_blocked = 3  # Abort if agent makes 3 blocked reads in a row
         
         # Cross-iteration deduplication for edits (prevent same edit being made multiple times)
         completed_edits = set()  # Track (path, start_line, end_line, content_hash) tuples
@@ -437,14 +439,15 @@ NEVER output a single file with 500+ lines - it will timeout and fail!""".format
         # Helper to execute a single tool and yield results
         async def execute_and_yield_tool(tool_call: dict) -> tuple[str, dict, str, dict]:
             """Execute a tool call and yield results to frontend. Returns (result_text, result_dict)."""
-            nonlocal completed_edits, read_only_operations, edit_operations, files_read, file_read_attempts, total_blocked_reads
+            nonlocal completed_edits, read_only_operations, edit_operations, files_read, file_read_attempts, total_blocked_reads, consecutive_blocked_reads
             
             tool_name = tool_call.get("tool")
             args = tool_call.get("args", {})
             
             # Block read operations if agent is in analysis paralysis mode
+            # NOTE: read_diagnostics is excluded - it verifies code correctness and should always be allowed
             read_tools = {'filesystem_read', 'grep', 'filesystem_list', 'filesystem_search',
-                          'codebase_search', 'glob_search', 'read_diagnostics'}
+                          'codebase_search', 'glob_search'}
             if tool_name in read_tools and read_only_operations >= max_reads_before_block and edit_operations == 0:
                 logger.warning("BLOCKING read operation - agent in analysis paralysis", 
                               tool=tool_name, read_ops=read_only_operations)
@@ -465,12 +468,14 @@ NEVER output a single file with 500+ lines - it will timeout and fail!""".format
                     file_read_attempts[file_path] = file_read_attempts.get(file_path, 0) + 1
                     attempts = file_read_attempts[file_path]
                     total_blocked_reads += 1
+                    consecutive_blocked_reads += 1  # Track consecutive blocks
                     
                     logger.error(
                         "BLOCKING duplicate file read - agent stuck in loop!",
                         path=file_path,
                         attempts=attempts,
                         total_blocked=total_blocked_reads,
+                        consecutive_blocked=consecutive_blocked_reads,
                         max_blocked=max_blocked_reads,
                         total_files_read=len(files_read)
                     )
@@ -547,6 +552,10 @@ Example:
             )
 
             logger.info("Tool execution result", tool=tool_name, success=result.get("success", False))
+            
+            # Reset consecutive blocked reads on successful tool execution (agent made progress)
+            if result.get("success") and not result.get("blocked"):
+                consecutive_blocked_reads = 0
 
             # Format result text for model
             result_text = f"Tool {tool_name} executed successfully." if result.get("success") else f"Tool {tool_name} failed."
@@ -633,6 +642,23 @@ Example:
                                  f"Files: {list(file_read_attempts.keys())[:5]}",
                         "type": "read_loop_detected",
                         "blocked_reads": total_blocked_reads
+                    })
+                    yield f"data: {abort_data}\n\n"
+                    break
+                
+                # SAFETY: Also abort on consecutive blocked reads (faster detection)
+                if consecutive_blocked_reads >= max_consecutive_blocked:
+                    logger.error(
+                        "ABORTING: Agent making consecutive blocked reads!",
+                        consecutive_blocked=consecutive_blocked_reads,
+                        total_blocked=total_blocked_reads,
+                        iteration=iteration
+                    )
+                    abort_data = json.dumps({
+                        "error": f"Agent stuck: {consecutive_blocked_reads} consecutive blocked reads. "
+                                 f"The agent is not making progress. Consider breaking down the task.",
+                        "type": "no_progress_detected",
+                        "consecutive_blocks": consecutive_blocked_reads
                     })
                     yield f"data: {abort_data}\n\n"
                     break
@@ -1453,10 +1479,34 @@ Example:
                                 "diff": result.get("diff"),
                                 "error": result.get("error"),
                                 "return_code": result.get("return_code"),
-                                "hint": result.get("hint")
+                                "hint": result.get("hint"),
+                                "verified": result.get("verified")  # Include verification flag
                             }
                         })
                         yield f"data: {tool_data}\n\n"
+                        
+                        # Send file_write_complete event for file write tools after actual execution
+                        if tool_name in ["filesystem_write", "filesystem_replace_lines", "filesystem_search_replace", "filesystem_insert"]:
+                            if result.get("success"):
+                                logger.info("File write completed and verified", 
+                                          tool=tool_name, 
+                                          path=result.get("path"),
+                                          verified=result.get("verified", False))
+                                file_complete_data = json.dumps({
+                                    "file_write_complete": {
+                                        "tool": tool_name,
+                                        "path": result.get("path"),
+                                        "action": result.get("action"),
+                                        "verified": result.get("verified", False),
+                                        "success": True
+                                    }
+                                })
+                                yield f"data: {file_complete_data}\n\n"
+                            else:
+                                logger.warning("File write failed", 
+                                             tool=tool_name, 
+                                             path=result.get("path"),
+                                             error=result.get("error"))
                         
                         tool_results.append({
                             "tool": tool_name,
