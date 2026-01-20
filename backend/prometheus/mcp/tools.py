@@ -3,6 +3,7 @@ import os
 import re
 import shlex
 import subprocess
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,26 @@ class GrepRequest(BaseModel):
     show_line_numbers: bool = True
     files_only: bool = False
     context_lines: int = 0
+
+
+def _run_async(coro):
+    """Run an async coroutine from sync code, handling uvloop properly.
+    
+    This handles the case where we're inside an async context (uvloop)
+    and need to run async code without nest_asyncio (which doesn't work with uvloop).
+    """
+    import concurrent.futures
+    
+    try:
+        # Check if there's a running loop
+        loop = asyncio.get_running_loop()
+        # We're inside an async context - use thread pool to run in new loop
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(lambda: asyncio.run(coro))
+            return future.result(timeout=60)
+    except RuntimeError:
+        # No running loop - we can use asyncio.run directly
+        return asyncio.run(coro)
 
 
 class MCPTools:
@@ -513,6 +534,302 @@ class MCPTools:
             return {"success": True, "path": path, "action": action}
         except ValueError as e:
             return {"error": str(e)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def read_diagnostics_async(self, path: str = "") -> dict[str, Any]:
+        """Async implementation of diagnostics reading."""
+        from prometheus.services.diagnostics_service import DiagnosticsService
+
+        try:
+            service = DiagnosticsService(str(self.workspace_path))
+            diagnostics = await service.get_diagnostics(path)
+
+            return {
+                "success": True,
+                "path": path,
+                "diagnostics": [d.dict() for d in diagnostics],
+                "error_count": len([d for d in diagnostics if d.severity == "error"]),
+                "warning_count": len([d for d in diagnostics if d.severity == "warning"]),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def read_diagnostics(self, path: str = "") -> dict[str, Any]:
+        """Get linter/type errors for a file or directory.
+
+        Args:
+            path (str): File or directory path within workspace.
+
+        Returns:
+            dict[str, Any]: Diagnostic results.
+        """
+        return _run_async(self.read_diagnostics_async(path))
+
+    def todo_write(self, todos: list[dict[str, Any]]) -> dict[str, Any]:
+        """Update the entire task list. Agent uses this to track progress.
+
+        Args:
+            todos (list[dict]): List of todo items with id, content, and status.
+
+        Returns:
+            dict[str, Any]: Operation result.
+        """
+        # Note: This is a placeholder for session-scoped state
+        # In a real app, this would be stored in a database or session manager
+        return {"success": True, "todos": todos, "message": "Task list updated"}
+
+    def todo_update(self, todo_id: str, status: str) -> dict[str, Any]:
+        """Update status of a specific todo.
+
+        Args:
+            todo_id (str): Unique identifier for the todo.
+            status (str): New status (pending, in_progress, completed, cancelled).
+
+        Returns:
+            dict[str, Any]: Operation result.
+        """
+        return {"success": True, "todo_id": todo_id, "status": status, "message": f"Task {todo_id} updated to {status}"}
+
+    def checkpoint_create(self, paths: list[str], description: str = "") -> dict[str, Any]:
+        """Create a checkpoint for the specified files.
+
+        Args:
+            paths (list[str]): List of file paths to include in the checkpoint.
+            description (str): Optional description of the checkpoint.
+
+        Returns:
+            dict[str, Any]: Operation result.
+        """
+        from prometheus.services.checkpoint_service import CheckpointService
+        
+        service = CheckpointService()
+        try:
+            checkpoint_id = _run_async(
+                service.create_checkpoint(str(self.workspace_path), paths, description)
+            )
+            return {"success": True, "checkpoint_id": checkpoint_id, "message": f"Checkpoint {checkpoint_id} created"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def checkpoint_restore(self, checkpoint_id: str) -> dict[str, Any]:
+        """Restore files from a checkpoint.
+
+        Args:
+            checkpoint_id (str): Unique identifier of the checkpoint to restore.
+
+        Returns:
+            dict[str, Any]: Operation result.
+        """
+        from prometheus.services.checkpoint_service import CheckpointService
+        
+        service = CheckpointService()
+        try:
+            result = _run_async(service.restore_checkpoint(checkpoint_id))
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
+    def checkpoint_list(self, limit: int = 10) -> dict[str, Any]:
+        """List recent checkpoints.
+
+        Args:
+            limit (int): Maximum number of checkpoints to return.
+
+        Returns:
+            dict[str, Any]: List of checkpoints.
+        """
+        from prometheus.services.checkpoint_service import CheckpointService
+        
+        service = CheckpointService()
+        try:
+            checkpoints = _run_async(
+                service.list_checkpoints(str(self.workspace_path), limit)
+            )
+            return {"success": True, "checkpoints": checkpoints}
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def codebase_search_async(self, query: str, limit: int = 10) -> dict[str, Any]:
+        """Async implementation of semantic search across the codebase."""
+        from prometheus.services.codebase_index import CodebaseIndex
+        from prometheus.database import get_all_settings
+        import structlog
+        logger = structlog.get_logger()
+        
+        try:
+            db_settings = await get_all_settings()
+            api_key = db_settings.get("openai_api_key")
+            
+            # Check if API key is available
+            if not api_key:
+                logger.warning("codebase_search: No OpenAI API key configured for embeddings")
+                return {
+                    "success": False,
+                    "error": "Semantic search unavailable - no OpenAI API key configured.",
+                    "hint": "Use 'grep' with recursive=True for pattern search, or 'glob_search' to find files by name pattern.",
+                    "fallback_suggestion": f'{{"tool": "grep", "args": {{"pattern": "{query.split()[0] if query else ""}", "path": "", "recursive": true}}}}'
+                }
+
+            index = CodebaseIndex(str(self.workspace_path), api_key=api_key)
+            
+            # Check if workspace is already indexed - if so, skip indexing
+            is_indexed = await index.is_indexed()
+            
+            if not is_indexed:
+                # Try to index, but don't fail if indexing is already in progress
+                index_result = await index.index_workspace()
+                
+                if not index_result.get("success"):
+                    error_msg = index_result.get("error", "Unknown error")
+                    
+                    # If indexing is in progress, wait a bit and check if indexed
+                    if "already in progress" in error_msg.lower():
+                        logger.info("codebase_search: Indexing in progress, waiting...")
+                        # Wait up to 5 seconds for indexing to complete enough entries
+                        for _ in range(10):
+                            await asyncio.sleep(0.5)
+                            if await index.is_indexed():
+                                logger.info("codebase_search: Index now available")
+                                break
+                        else:
+                            # Still not indexed, return helpful message
+                            return {
+                                "success": False,
+                                "error": "Workspace is still being indexed. Try again in a few seconds.",
+                                "hint": "Use 'grep' with recursive=True as immediate fallback, or wait for indexing to complete.",
+                                "fallback_suggestion": f'{{"tool": "grep", "args": {{"pattern": "{query.split()[0] if query else ""}", "path": "", "recursive": true}}}}'
+                            }
+                    else:
+                        logger.warning("codebase_search: Indexing failed", error=error_msg)
+                        return {
+                            "success": False,
+                            "error": f"Workspace indexing failed: {error_msg}",
+                            "hint": "Use 'grep' with recursive=True as fallback."
+                        }
+            
+            # Search the index
+            results = await index.search(query, limit)
+            
+            if not results:
+                # Provide index stats for debugging
+                index_count = await index.get_index_count()
+                return {
+                    "success": True,
+                    "results": [],
+                    "message": f"No semantic matches found for '{query}' in {index_count} indexed chunks. Try 'grep' for exact pattern search."
+                }
+            
+            logger.info("codebase_search completed", query=query, results_count=len(results))
+            return {"success": True, "results": results}
+            
+        except Exception as e:
+            logger.error("codebase_search failed", error=str(e), query=query)
+            return {
+                "success": False,
+                "error": str(e),
+                "hint": "Use 'grep' with pattern search as fallback: {\"tool\": \"grep\", \"args\": {\"pattern\": \"...\", \"path\": \"\", \"recursive\": true}}"
+            }
+
+    def codebase_search(self, query: str, limit: int = 10) -> dict[str, Any]:
+        """Semantic search across the codebase.
+
+        Args:
+            query (str): Natural language query.
+            limit (int): Maximum number of results to return.
+
+        Returns:
+            dict[str, Any]: Search results.
+        """
+        return _run_async(self.codebase_search_async(query, limit))
+
+    def verify_changes(self, verification_steps: list[str]) -> dict[str, Any]:
+        """Run multiple verification steps to confirm changes work as expected.
+
+        Args:
+            verification_steps (list[str]): List of strings describing verification steps.
+                Format: "lint:path", "test:path", "run:command", "import:module".
+
+        Returns:
+            dict[str, Any]: Results of all verification steps.
+        """
+        results = []
+        all_passed = True
+        
+        for step in verification_steps:
+            try:
+                if ":" not in step:
+                    results.append({"step": step, "passed": False, "error": "Invalid format (missing ':')" })
+                    all_passed = False
+                    continue
+                    
+                step_type, step_target = step.split(":", 1)
+                step_result = {"step": step, "passed": False}
+                
+                if step_type == "lint":
+                    res = self.read_diagnostics(step_target)
+                    step_result["passed"] = res.get("success", False) and res.get("error_count", 0) == 0
+                    step_result["details"] = res
+                elif step_type == "test":
+                    res = self.run_tests(step_target)
+                    step_result["passed"] = res.get("success", False)
+                    step_result["details"] = res
+                elif step_type == "run":
+                    res = self.shell_execute(step_target)
+                    step_result["passed"] = res.get("return_code") == 0
+                    step_result["details"] = res
+                elif step_type == "import":
+                    res = self.shell_execute(f"python3 -c 'import {step_target}'")
+                    step_result["passed"] = res.get("return_code") == 0
+                    step_result["details"] = res
+                else:
+                    step_result["error"] = f"Unknown step type: {step_type}"
+                
+                if not step_result["passed"]:
+                    all_passed = False
+                results.append(step_result)
+            except Exception as e:
+                results.append({"step": step, "passed": False, "error": str(e)})
+                all_passed = False
+                
+        return {"success": all_passed, "verification_results": results}
+
+    def glob_search(self, pattern: str, path: str = "") -> dict[str, Any]:
+        """Search for files matching a glob pattern.
+
+        Args:
+            pattern (str): Glob pattern (e.g., "**/*.py").
+            path (str): Base directory to search in (relative to workspace).
+
+        Returns:
+            dict[str, Any]: List of matching file paths.
+        """
+        try:
+            search_path = self._validate_path(path) if path else self.workspace_path
+            matches = list(search_path.glob(pattern))
+            return {
+                "success": True,
+                "pattern": pattern,
+                "matches": [str(m.relative_to(self.workspace_path)) for m in matches[:100]]
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def web_fetch(self, url: str) -> dict[str, Any]:
+        """Fetch content from a URL.
+
+        Args:
+            url (str): The URL to fetch.
+
+        Returns:
+            dict[str, Any]: Result of the fetch operation.
+        """
+        from prometheus.services.web_service import WebService
+        
+        service = WebService()
+        try:
+            result = _run_async(service.fetch(url))
+            return result
         except Exception as e:
             return {"error": str(e)}
 

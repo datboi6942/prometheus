@@ -13,11 +13,15 @@
 	import RulesPanel from '$lib/components/panels/RulesPanel.svelte';
 	import MemoriesPanel from '$lib/components/panels/MemoriesPanel.svelte';
 	import MCPServersPanel from '$lib/components/panels/MCPServersPanel.svelte';
+	import TodoPanel from '$lib/components/panels/TodoPanel.svelte';
+	import CheckpointsPanel from '$lib/components/panels/CheckpointsPanel.svelte';
 	import TerminalPanel from '$lib/components/panels/TerminalPanel.svelte';
 	import GitPanel from '$lib/components/panels/GitPanel.svelte';
+	import AgentActivityPanel from '$lib/components/panels/AgentActivityPanel.svelte';
 	import DiffViewer from '$lib/components/chat/DiffViewer.svelte';
 	import ThinkingBlock from '$lib/components/chat/ThinkingBlock.svelte';
 	import ToolExecutionCard from '$lib/components/chat/ToolExecutionCard.svelte';
+	import IndexingProgressBar from '$lib/components/ui/IndexingProgressBar.svelte';
 
 	// Import stores
 	import {
@@ -26,10 +30,11 @@
 		conversations, currentConversationId, globalRules, projectRules,
 		memories, mcpServers, availableTools, files, isLoadingFiles,
 		showExplorer, activeExplorerTab, activeView, showTerminalPanel,
+		showTodoPanel, showCheckpointsPanel, agentTodos,
 		messages, chatInput, isLoading, isConnected, abortController,
 		currentOpenFile, editorHasUnsavedChanges, toolExecutions, activeToolCalls,
 		gitStatus, gitBranches, gitCommits, isGitRepo, githubAuthenticated, githubUser,
-		contextInfo, activeThinking, iterationProgress, iterationWarning
+		contextInfo, activeThinking, iterationProgress, iterationWarning, agentStatus, reasoningWarning
 	} from '$lib/stores';
 	
 	// Import API functions
@@ -801,6 +806,20 @@
 									addLog(`Compressed: saved ${data.context_info.tokens_saved?.toLocaleString()} tokens`);
 								}
 							}
+
+							// New SSE handlers for self-improvement features
+							if (data.diagnostics) {
+								console.log('Linter results:', data.diagnostics);
+							}
+							if (data.todo_update) {
+								$agentTodos = data.todo_update;
+							}
+							if (data.checkpoint_created) {
+								console.log('Checkpoint created:', data.checkpoint_created);
+							}
+							if (data.verification_result) {
+								console.log('Verification result:', data.verification_result);
+							}
 						} catch (e) {
 							console.error('Error parsing SSE data:', e);
 						}
@@ -848,6 +867,7 @@
 		$toolExecutions = []; // Clear previous tool executions for this message
 		$iterationProgress = null; // Clear iteration progress
 		$iterationWarning = null; // Clear iteration warning
+		$reasoningWarning = null; // Clear reasoning warning
 		
 		if (!$currentConversationId) {
 			await createNewConversation();
@@ -998,6 +1018,12 @@
 								}
 							}
 
+							// Handle agent status updates (reasoning model info)
+							if (data.agent_status) {
+								$agentStatus = data.agent_status;
+								console.log('Agent status:', data.agent_status);
+							}
+
 							// Handle thinking chunks (DeepSeek R1 reasoning)
 							if (data.thinking_chunk) {
 								if (!$activeThinking) {
@@ -1048,6 +1074,23 @@
 								addLog(`⚠️ ${data.iteration_warning.message}`);
 							}
 
+							// Handle reasoning warning (overthinking detection)
+							if (data.reasoning_warning) {
+								console.warn('Reasoning warning:', data.reasoning_warning);
+								addLog(`⚡ ${data.reasoning_warning.message} (${Math.round(data.reasoning_warning.length / 1000)}k chars)`);
+								reasoningWarning.set(data.reasoning_warning);
+							}
+
+							// Handle warnings (stream timeouts, etc.)
+							if (data.warning) {
+								console.warn('Stream warning:', data.warning);
+								if (data.warning.type === 'stream_timeout') {
+									addLog(`⚠️ ${data.warning.message}`);
+								} else {
+									addLog(`⚠️ ${data.warning.message || 'Unknown warning'}`);
+								}
+							}
+
 							// Handle errors
 							if (data.error) {
 								console.error('Stream error:', data.error);
@@ -1056,6 +1099,11 @@
 								// Check if it's the iteration limit error
 								if (data.error.includes('iteration limit')) {
 									addLog(`ℹ️ Agent hit iteration limit (${data.iteration || '?'}/${data.max_iterations || '50'}). Try breaking down your request into smaller steps.`);
+								}
+								
+								// Check if it's a stream failure
+								if (data.type === 'stream_failure') {
+									addLog(`🔴 Model connection failed. Please check your configuration.`);
 								}
 							}
 
@@ -1098,8 +1146,10 @@
 				}
 			}
 
-			// Clear active thinking
+			// Clear active thinking and agent status
 			$activeThinking = null;
+			$agentStatus = null;
+			$reasoningWarning = null;
 			$isLoading = false;
 			$isConnected = false;
 		}
@@ -1855,13 +1905,19 @@
 			{/if}
 		</div>
 	</main>
+
+	<!-- Agent Activity Panel (right side) -->
+	<AgentActivityPanel />
 	
 	<!-- Extracted Panel Components -->
 	<SettingsPanel />
 	<RulesPanel />
 	<MemoriesPanel />
 	<MCPServersPanel />
+	<TodoPanel visible={$showTodoPanel} />
+	<CheckpointsPanel visible={$showCheckpointsPanel} />
 	<TerminalPanel />
+	<IndexingProgressBar />
 </div>
 
 <style>

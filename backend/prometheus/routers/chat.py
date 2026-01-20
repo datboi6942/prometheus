@@ -58,6 +58,7 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
     logger = structlog.get_logger()
     
     tool_calls = []
+    truncation_detected = False
     
     # Strategy 1: Look for {"tool" pattern with regex
     patterns = [
@@ -106,6 +107,20 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
                                 logger.warning("JSON decode failed", error=str(e), json_preview=json_str[:100])
                             break
                 j += 1
+            
+            # Check if we reached the end without finding closing brace (truncated JSON)
+            if j >= len(text) and brace_count > 0:
+                truncation_detected = True
+                # Extract tool name from the truncated JSON for logging
+                tool_name_match = re.search(r'"tool"\s*:\s*"([^"]+)"', text[start:])
+                tool_name = tool_name_match.group(1) if tool_name_match else "unknown"
+                logger.warning(
+                    "TRUNCATED JSON DETECTED - model output was cut off",
+                    tool=tool_name,
+                    brace_depth=brace_count,
+                    text_length=len(text),
+                    hint="Model likely hit max_tokens limit. The output was truncated before the JSON could complete."
+                )
     
     # Strategy 2: Try to find JSON objects that look like tool calls using simple search
     if not tool_calls:
@@ -160,7 +175,16 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
                                     break
                         j += 1
     
-    logger.info("Tool extraction complete", found=len(tool_calls), text_preview=text[:200] if text else "")
+    if truncation_detected and not tool_calls:
+        logger.error(
+            "Tool extraction failed due to truncation",
+            found=0,
+            truncated=True,
+            text_preview=text[:200] if text else "",
+            hint="Model output was truncated. Increase max_tokens or simplify the task."
+        )
+    else:
+        logger.info("Tool extraction complete", found=len(tool_calls), text_preview=text[:200] if text else "")
     
     return tool_calls
 
@@ -302,73 +326,53 @@ async def chat_stream(
     
     tools_text = "\n".join(tools_list) if tools_list else "No tools available"
 
-    # System prompt - Claude Code inspired, focused and effective
-    system_prompt = """You are Prometheus, an expert AI coding assistant. You help users with software engineering tasks by reading, writing, and modifying code.
+    # System prompt - emphasizing parallel tool calls and key tools
+    system_prompt = """You are Prometheus, an expert AI coding assistant.
 
-TOOLS:
+🚀 PARALLEL TOOL CALLING (CRITICAL - USE THIS!):
+You can output MULTIPLE tool calls in a SINGLE response! When you need to do multiple independent operations, output ALL tool calls at once:
+
+{{"tool": "codebase_search", "args": {{"query": "authentication logic", "limit": 10}}}}
+{{"tool": "glob_search", "args": {{"pattern": "**/*.py", "path": "."}}}}
+{{"tool": "filesystem_list", "args": {{"path": "."}}}}
+
+All three will execute IN PARALLEL. This is MUCH faster than calling one at a time!
+
+🔍 TIER 1 TOOLS (USE FIRST - HIGHEST PRIORITY):
+• codebase_search: SEMANTIC SEARCH - finds code by meaning, not just text matching
+  Use FIRST when exploring a codebase or finding where something is implemented
+  Example: {{"tool": "codebase_search", "args": {{"query": "where is user authentication handled", "limit": 10}}}}
+
+• read_diagnostics: LINTER ERROR CHECK - shows syntax errors, type errors, undefined variables
+  Use AFTER EVERY EDIT to verify your changes don't introduce errors
+  Example: {{"tool": "read_diagnostics", "args": {{"path": "file.py"}}}}
+
+AVAILABLE TOOLS:
 {tools_text}
 
-TOOL FORMAT - Output exactly this JSON when using tools:
+TOOL FORMAT:
 {{"tool": "TOOL_NAME", "args": {{"param": "value"}}}}
 
-CORE PRINCIPLES:
+WORKFLOW FOR EXPLORING CODE:
+1. Use codebase_search FIRST to find relevant code by meaning
+2. Use grep for exact text/pattern matching
+3. Use filesystem_read to read specific files you found
+4. Make edits with filesystem_replace_lines or filesystem_search_replace
+5. Use read_diagnostics AFTER edits to check for errors
 
-1. ACT, DON'T JUST TALK
-   - When you say "I'll do X" - DO IT IMMEDIATELY with a tool call
-   - Never end a response with "Let me..." or "I'll..." without the actual tool call
-   - Reading a file is step 1. Editing is step 2. Always complete both.
+WORKFLOW FOR FIXING BUGS:
+1. Read the file with the error
+2. Make the fix with filesystem_replace_lines
+3. Run read_diagnostics to verify no new errors
+4. Done!
 
-2. ONE TOOL AT A TIME
-   - Call one tool, wait for results, then continue
-   - You'll automatically receive tool results - no need to ask
-
-3. USE THE RIGHT TOOL FOR EDITS
-   - grep: Search for patterns across files (supports regex, recursive, case-insensitive)
-   - filesystem_read: Read files (path required, optional: offset/limit for large files)
-   - filesystem_replace_lines: Replace specific lines (use start_line, end_line, replacement)
-   - filesystem_search_replace: Find and replace text patterns
-   - filesystem_insert: Add new lines at a position
-   - filesystem_write: ONLY for creating NEW files
-
-   NEVER use filesystem_write on existing files - use targeted edits instead!
-
-4. FIX ERRORS EFFICIENTLY
-   - When you see an error, identify the exact line and fix it
-   - Don't re-read files you just read - use the content you have
-   - Don't create helper scripts - use your tools directly
-   - If an edit fails, check the error message and adjust your approach
-
-5. COMPLETE THE TASK
-   - Keep making tool calls until the job is 100% done
-   - Don't stop after reading - make the actual changes
-   - Don't stop after one edit if more are needed
-   - Summarize what you did only AFTER finishing
-
-WORKFLOW EXAMPLE:
-User: "Fix the syntax error in app.py"
-
-{{"tool": "filesystem_read", "args": {{"path": "app.py"}}}}
-[Results show line 42 has missing colon]
-
-Found the issue on line 42. Fixing now.
-{{"tool": "filesystem_replace_lines", "args": {{"path": "app.py", "start_line": 42, "end_line": 42, "replacement": "def process_data(x):\\n"}}}}
-[Success]
-
-Fixed the syntax error - added missing colon on line 42.
-
-CRITICAL REMINDERS:
-- filesystem_read supports optional offset/limit for large files, but usually just read the whole file
-- Always use filesystem_replace_lines/search_replace/insert for existing files
-- Never output partial tool JSON - complete the full {{"tool": ..., "args": ...}} structure
-- Be concise - users want results, not lengthy explanations
-
-🚨 ANTI-ANALYSIS-PARALYSIS RULES:
-- After reading 1-2 files, you MUST start making edits. Do NOT read more than necessary.
-- If you see an error, identify the line and FIX IT IMMEDIATELY in the same turn.
-- DO NOT re-read a file you already read. Use the content you have.
-- DO NOT explain what you "will" do - just DO IT with a tool call.
-- Your job is to COMPLETE tasks, not just analyze them. Every response should include action.
-- If the user shows an error, your FIRST read should be followed by an EDIT in the same turn.""".format(tools_text=tools_text)
+CRITICAL RULES:
+1. USE PARALLEL TOOL CALLS! Output multiple {{"tool":...}} in one response when operations are independent
+2. Use codebase_search FIRST to understand code semantically
+3. Use read_diagnostics AFTER EVERY EDIT - this is mandatory
+4. Don't say "I'll do X" without actually doing it - include the tool call
+5. After reading 1-2 files, START EDITING. Don't over-analyze.
+6. Complete the task fully before summarizing""".format(tools_text=tools_text)
 
     # Inject user-defined rules
     rules_text = await get_enabled_rules_text(request.workspace_path or "")
@@ -420,6 +424,10 @@ CRITICAL REMINDERS:
         
         # Cross-iteration deduplication for edits (prevent same edit being made multiple times)
         completed_edits = set()  # Track (path, start_line, end_line, content_hash) tuples
+        
+        # Track stream retries to prevent infinite retry loops
+        empty_stream_retries = 0
+        max_empty_stream_retries = 3  # Max consecutive empty streams before giving up
 
         # Helper to execute a single tool and yield results
         async def execute_and_yield_tool(tool_call: dict) -> tuple[str, dict, str, dict]:
@@ -430,7 +438,8 @@ CRITICAL REMINDERS:
             args = tool_call.get("args", {})
             
             # Block read operations if agent is in analysis paralysis mode
-            read_tools = {'filesystem_read', 'grep', 'filesystem_list', 'filesystem_search'}
+            read_tools = {'filesystem_read', 'grep', 'filesystem_list', 'filesystem_search',
+                          'codebase_search', 'glob_search', 'read_diagnostics'}
             if tool_name in read_tools and read_only_operations >= max_reads_before_block and edit_operations == 0:
                 logger.warning("BLOCKING read operation - agent in analysis paralysis", 
                               tool=tool_name, read_ops=read_only_operations)
@@ -583,7 +592,13 @@ CRITICAL REMINDERS:
                 model_is_reasoning = is_reasoning_model(request.model)
                 is_ollama_reasoning = model_is_reasoning and "ollama" in request.model.lower()
 
-                logger.info("Starting model stream", iteration=iteration, message_count=len(current_messages), model_is_reasoning=model_is_reasoning, is_ollama_reasoning=is_ollama_reasoning)
+                logger.info(
+                    "Starting model stream for iteration",
+                    iteration=iteration,
+                    message_count=len(current_messages),
+                    model=request.model,
+                    model_is_reasoning=model_is_reasoning
+                )
 
                 # Stream iteration progress to frontend
                 progress_data = json.dumps({
@@ -607,6 +622,9 @@ CRITICAL REMINDERS:
                 in_think_tag = False  # Whether we're inside <think>...</think>
                 think_buffer = ""  # Buffer for thinking content
                 pending_content = ""  # Content that might be part of opening/closing tag
+                
+                # Track if we received any chunks from the model
+                chunks_received = 0
 
                 async for chunk in model_router.stream(
                     model=request.model,
@@ -614,6 +632,7 @@ CRITICAL REMINDERS:
                     api_base=request.api_base,
                     api_key=api_key_to_use,
                 ):
+                    chunks_received += 1
                     if chunk.choices and chunk.choices[0].delta:
                         delta = chunk.choices[0].delta
 
@@ -758,11 +777,11 @@ CRITICAL REMINDERS:
                                     safe_to_stream_pos = safe_end
                                     stream_buffer = accumulated_response[safe_to_stream_pos:]
 
-                                # Process any new tool calls found
+                                # Collect tool calls for parallel execution after stream completes
                                 for tool_call, start, end in tool_calls:
                                     tool_signature = json.dumps(tool_call, sort_keys=True)
 
-                                    # Skip if already processed
+                                    # Skip if already collected
                                     if tool_signature in processed_tool_signatures:
                                         continue
 
@@ -770,7 +789,7 @@ CRITICAL REMINDERS:
                                     safe_to_stream_pos = end  # Skip over the tool call JSON
                                     stream_buffer = accumulated_response[safe_to_stream_pos:]
 
-                                    # Send tool call notification IMMEDIATELY
+                                    # Send tool call notification to frontend
                                     tool_call_notification = json.dumps({
                                         "tool_call": {
                                             "tool": tool_call.get("tool"),
@@ -780,54 +799,10 @@ CRITICAL REMINDERS:
                                     yield f"data: {tool_call_notification}\n\n"
                                     logger.info("Tool call detected during stream", tool=tool_call.get("tool"))
 
-                                    # Execute tool IMMEDIATELY
-                                    result_text, result, tool_name, args = await execute_and_yield_tool(tool_call)
-
-                                    # Check if permission required
-                                    if result.get("permission_required"):
-                                        permission_data = json.dumps({
-                                            "permission_request": {
-                                                "command": result.get("command"),
-                                                "full_command": result.get("full_command"),
-                                                "tool": tool_name,
-                                                "message": result.get("message"),
-                                            }
-                                        })
-                                        yield f"data: {permission_data}\n\n"
-                                        tool_results.append({
-                                            "tool": tool_name,
-                                            "result": f"⚠️ Permission required to run command: {result.get('command')}\n\nThis command needs your approval before it can be executed.",
-                                        })
-                                        continue
-
-                                    # Send tool execution result to frontend IMMEDIATELY
-                                    tool_data = json.dumps({
-                                        "tool_execution": {
-                                            "tool": tool_name,
-                                            "args": args,
-                                            "success": result.get("success", False),
-                                            "path": result.get("path"),
-                                            "file": result.get("file"),
-                                            "command": result.get("command"),
-                                            "action": result.get("action"),
-                                            "stdout": result.get("stdout"),
-                                            "stderr": result.get("stderr"),
-                                            "content": result.get("content"),
-                                            "diff": result.get("diff"),
-                                            "error": result.get("error"),
-                                            "return_code": result.get("return_code"),
-                                            "hint": result.get("hint")
-                                        }
-                                    })
-                                    yield f"data: {tool_data}\n\n"
-
+                                    # Collect for parallel execution (don't execute yet)
                                     tool_calls_found.append({
                                         "call": tool_call,
                                         "signature": tool_signature
-                                    })
-                                    tool_results.append({
-                                        "tool": tool_name,
-                                        "result": result_text
                                     })
 
                             # If buffer gets too large and we're confident it's not a tool call, stream it
@@ -930,6 +905,131 @@ CRITICAL REMINDERS:
                         token_data = json.dumps({"token": clean_buffer.strip()})
                         yield f"data: {token_data}\n\n"
 
+                # ========== HANDLE STREAM TIMEOUT/FAILURE ==========
+                # If we didn't receive any chunks, the stream likely timed out or failed silently
+                if chunks_received == 0:
+                    empty_stream_retries += 1
+                    logger.warning(
+                        "Model stream returned no chunks - possible timeout or API issue",
+                        iteration=iteration,
+                        model=request.model,
+                        message_count=len(current_messages),
+                        retry_count=empty_stream_retries,
+                        max_retries=max_empty_stream_retries
+                    )
+                    
+                    if empty_stream_retries >= max_empty_stream_retries:
+                        # Too many retries - give up and report error
+                        error_data = json.dumps({
+                            "error": f"Model failed to respond after {max_empty_stream_retries} attempts. "
+                                     f"Check your API key, network connection, or try a different model.",
+                            "type": "stream_failure"
+                        })
+                        yield f"data: {error_data}\n\n"
+                        break
+                    
+                    # Notify frontend about the stream failure
+                    stream_warning = json.dumps({
+                        "warning": {
+                            "type": "stream_timeout",
+                            "message": f"Model did not respond (attempt {empty_stream_retries}/{max_empty_stream_retries}). Retrying...",
+                            "iteration": iteration
+                        }
+                    })
+                    yield f"data: {stream_warning}\n\n"
+                    
+                    # Add a brief delay before retrying to avoid hammering the API
+                    import asyncio as aio
+                    await aio.sleep(2.0 * empty_stream_retries)  # Exponential backoff
+                    
+                    # Continue to next iteration (retry the model call)
+                    continue
+                else:
+                    # Successful stream - reset retry counter
+                    empty_stream_retries = 0
+
+                # ========== PARALLEL TOOL EXECUTION ==========
+                # Execute all collected tool calls in parallel
+                if tool_calls_found:
+                    import asyncio
+                    
+                    logger.info("Executing tool calls in parallel", count=len(tool_calls_found))
+                    
+                    # Create tasks for all tool calls
+                    async def execute_single_tool(tc_info):
+                        """Execute a single tool and return result with metadata."""
+                        tool_call = tc_info["call"]
+                        result_text, result, tool_name, args = await execute_and_yield_tool(tool_call)
+                        return {
+                            "tool_call": tool_call,
+                            "result_text": result_text,
+                            "result": result,
+                            "tool_name": tool_name,
+                            "args": args
+                        }
+                    
+                    # Execute all tools in parallel
+                    tasks = [execute_single_tool(tc) for tc in tool_calls_found]
+                    parallel_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Process results and send to frontend
+                    for pr in parallel_results:
+                        if isinstance(pr, Exception):
+                            logger.error("Tool execution failed", error=str(pr))
+                            tool_results.append({
+                                "tool": "unknown",
+                                "result": f"Tool execution failed: {str(pr)}"
+                            })
+                            continue
+                        
+                        tool_name = pr["tool_name"]
+                        args = pr["args"]
+                        result = pr["result"]
+                        result_text = pr["result_text"]
+                        
+                        # Check if permission required
+                        if result.get("permission_required"):
+                            permission_data = json.dumps({
+                                "permission_request": {
+                                    "command": result.get("command"),
+                                    "full_command": result.get("full_command"),
+                                    "tool": tool_name,
+                                    "message": result.get("message"),
+                                }
+                            })
+                            yield f"data: {permission_data}\n\n"
+                            tool_results.append({
+                                "tool": tool_name,
+                                "result": f"⚠️ Permission required to run command: {result.get('command')}\n\nThis command needs your approval before it can be executed.",
+                            })
+                            continue
+                        
+                        # Send tool execution result to frontend
+                        tool_data = json.dumps({
+                            "tool_execution": {
+                                "tool": tool_name,
+                                "args": args,
+                                "success": result.get("success", False),
+                                "path": result.get("path"),
+                                "file": result.get("file"),
+                                "command": result.get("command"),
+                                "action": result.get("action"),
+                                "stdout": result.get("stdout"),
+                                "stderr": result.get("stderr"),
+                                "content": result.get("content"),
+                                "diff": result.get("diff"),
+                                "error": result.get("error"),
+                                "return_code": result.get("return_code"),
+                                "hint": result.get("hint")
+                            }
+                        })
+                        yield f"data: {tool_data}\n\n"
+                        
+                        tool_results.append({
+                            "tool": tool_name,
+                            "result": result_text
+                        })
+
                 # Get clean response for conversation history
                 clean_response = strip_tool_calls(accumulated_response)
 
@@ -940,13 +1040,14 @@ CRITICAL REMINDERS:
                         "content": clean_response.strip()
                     })
 
-                # Add tool results to conversation if any tools were executed during streaming
+                # Add tool results to conversation if any tools were executed
                 if tool_results:
                     # Reset consecutive lazy kicks since the model actually did something
                     consecutive_lazy_kicks = 0
                     
                     # Track read vs edit operations
-                    read_tools = {'filesystem_read', 'grep', 'filesystem_list', 'filesystem_search'}
+                    read_tools = {'filesystem_read', 'grep', 'filesystem_list', 'filesystem_search', 
+                                  'codebase_search', 'glob_search', 'read_diagnostics'}
                     edit_tools = {'filesystem_write', 'filesystem_replace_lines', 'filesystem_insert', 
                                   'filesystem_search_replace', 'filesystem_delete', 'shell_execute', 'run_python'}
                     
@@ -1035,6 +1136,46 @@ DO IT NOW. No more reading. No more explaining. Just the tool call."""
                         yield f"data: {compression_notification}\n\n"
 
                     # Continue loop to get model's next response
+                    continue
+                
+                # Check for truncated tool call JSON (model output was cut off)
+                # This happens when max_tokens is hit during a large file write
+                truncation_patterns = [
+                    r'\{"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^}]*$',  # Tool call started but never closed
+                    r'"content"\s*:\s*"[^"]*$',  # Content string never closed
+                ]
+                response_might_be_truncated = any(
+                    re.search(p, accumulated_response[-500:] if len(accumulated_response) > 500 else accumulated_response)
+                    for p in truncation_patterns
+                )
+                
+                if response_might_be_truncated and consecutive_lazy_kicks < max_lazy_kicks:
+                    consecutive_lazy_kicks += 1
+                    logger.warning(
+                        "Detected truncated tool call - model output was cut off",
+                        response_length=len(accumulated_response),
+                        consecutive=consecutive_lazy_kicks
+                    )
+                    
+                    truncation_message = """⚠️ YOUR OUTPUT WAS TRUNCATED!
+
+Your tool call JSON was cut off mid-stream (likely hit the output token limit).
+
+DO NOT try to write large files in a single tool call. Instead:
+
+1. For NEW FILES: Write in smaller chunks or use filesystem_insert multiple times
+2. For EDITS: Use filesystem_replace_lines to edit specific line ranges instead of rewriting entire files
+3. For TEST FILES: Create a minimal test first, then add more tests incrementally
+
+RETRY with a SMALLER output. Example:
+{"tool": "filesystem_write", "args": {"path": "test_file.py", "content": "# Basic test file\\nimport unittest\\n\\nclass TestBasic(unittest.TestCase):\\n    def test_example(self):\\n        self.assertTrue(True)\\n"}}
+
+Keep the content SHORT. Do NOT include the full file."""
+                    
+                    current_messages.append({
+                        "role": "user",
+                        "content": truncation_message
+                    })
                     continue
                 
                 # No tool calls found - check if model is truly done or just being lazy
