@@ -16,7 +16,7 @@ export const apiKeys = writable({
 	google: '',
 	litellm: ''
 });
-export const workspacePath = writable('/tmp/prometheus_workspace');
+export const workspacePath = writable('');
 export const verboseMode = writable(false);
 export const autoApproveEdits = writable(true);
 export const settingsLoaded = writable(false);
@@ -26,8 +26,11 @@ export const showSettings = writable(false);
 export const showRulesPanel = writable(false);
 export const showMemoriesPanel = writable(false);
 export const showMCPServersPanel = writable(false);
+export const showTodoPanel = writable(false);
+export const showCheckpointsPanel = writable(false);
 export const showExplorer = writable(true);
 export const showTerminalPanel = writable(false);
+export const showAgentPanel = writable(true);  // Agent activity panel - visible by default
 export const activeView = writable<'chat' | 'forge'>('chat');
 export const activeExplorerTab = writable<'files' | 'search' | 'history' | 'git'>('files');
 
@@ -144,6 +147,8 @@ export const iterationProgress = writable<{
 	message_count: number;
 	read_ops?: number;
 	edit_ops?: number;
+	files_read?: string[];
+	files_edited?: Record<string, number>;  // path -> edit count
 } | null>(null);
 
 // Iteration Warning (when approaching limit)
@@ -151,5 +156,41 @@ export const iterationWarning = writable<{
 	current: number;
 	max: number;
 	remaining: number;
+	message: string;
+} | null>(null);
+
+// Agent Status (for reasoning model activity)
+export const agentStatus = writable<{
+	status: string;
+	model: string;
+	is_reasoning_model: boolean;
+	message: string;
+} | null>(null);
+
+// Agent TODOs
+export const agentTodos = writable<Array<{
+	id: string;
+	content: string;
+	status: 'pending' | 'in_progress' | 'completed' | 'cancelled';
+}>>([]);
+
+// Indexing Status
+export const indexingStatus = writable<{
+	status: 'idle' | 'starting' | 'indexing' | 'completed' | 'error';
+	total: number;
+	current: number;
+	percent: number;
+	file?: string;
+	error?: string;
+}>({
+	status: 'idle',
+	total: 0,
+	current: 0,
+	percent: 0
+});
+
+// Reasoning Warning (when agent is overthinking)
+export const reasoningWarning = writable<{
+	length: number;
 	message: string;
 } | null>(null);

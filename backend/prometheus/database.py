@@ -235,6 +235,34 @@ async def init_db() -> None:
             )
         """)
 
+        # Checkpoints table (for undo/rollback)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                id TEXT PRIMARY KEY,
+                workspace_path TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                description TEXT,
+                conversation_id TEXT,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+            )
+        """)
+
+        # Codebase embeddings table (for semantic search)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS codebase_embeddings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_path TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                chunk_start INTEGER NOT NULL,
+                chunk_end INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
         # Create index for faster memory searches
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_workspace ON memories(workspace_path)
@@ -244,6 +272,15 @@ async def init_db() -> None:
         """)
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_command_permissions_command ON command_permissions(command)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_workspace ON checkpoints(workspace_path)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_codebase_embeddings_workspace ON codebase_embeddings(workspace_path)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_codebase_embeddings_file ON codebase_embeddings(file_path)
         """)
 
         await db.commit()

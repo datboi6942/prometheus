@@ -26,6 +26,26 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     debug: bool = False
 
+    # Self-improvement features
+    auto_run_tests: bool = True
+    auto_run_lints: bool = True
+    parallel_execution: bool = True
+    max_parallel_tools: int = 5
+
+    # Embeddings
+    use_openai_embeddings: bool = True
+    openai_embedding_model: str = "text-embedding-3-small"
+    local_embedding_model: str = "all-MiniLM-L6-v2"
+
+    # Checkpoints
+    auto_checkpoint_before_edits: bool = True
+    max_checkpoints_per_file: int = 10
+    checkpoint_retention_days: int = 7
+
+    # LSP
+    python_lsp_command: str = "pylsp"
+    typescript_lsp_command: str = "typescript-language-server --stdio"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 

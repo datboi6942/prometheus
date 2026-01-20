@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { 
 		File, Search, History, GitBranch, MessageSquare, 
-		Terminal as TerminalIcon, BookOpen, Code2, Settings 
+		Terminal as TerminalIcon, BookOpen, Code2, Settings, Brain, ListTodo, Undo2
 	} from 'lucide-svelte';
 	import { 
 		showExplorer, 
@@ -11,7 +11,12 @@
 		showRulesPanel,
 		showMemoriesPanel,
 		showMCPServersPanel,
-		showSettings
+		showTodoPanel,
+		showCheckpointsPanel,
+		showSettings,
+		showAgentPanel,
+		isLoading,
+		activeThinking
 	} from '$lib/stores';
 </script>
 
@@ -73,6 +78,18 @@
 		<TerminalIcon class="w-5 h-5" />
 	</button>
 
+	<!-- Agent Activity Panel -->
+	<button 
+		on:click={() => $showAgentPanel = !$showAgentPanel}
+		class="activity-btn {$showAgentPanel ? 'active' : ''} relative"
+		title="Agent Activity">
+		<Brain class="w-5 h-5" />
+		{#if $isLoading || $activeThinking?.isActive}
+			<span class="absolute top-1 right-1 w-2 h-2 bg-purple-500 rounded-full animate-ping"></span>
+			<span class="absolute top-1 right-1 w-2 h-2 bg-purple-500 rounded-full"></span>
+		{/if}
+	</button>
+
 	<div class="flex-1"></div>
 
 	<!-- Rules -->
@@ -97,6 +114,22 @@
 		class="activity-btn {$showMCPServersPanel ? 'active' : ''}"
 		title="MCP Servers">
 		<Code2 class="w-5 h-5" />
+	</button>
+
+	<!-- Task List -->
+	<button 
+		on:click={() => $showTodoPanel = !$showTodoPanel}
+		class="activity-btn {$showTodoPanel ? 'active' : ''}"
+		title="Agent Task List">
+		<ListTodo class="w-5 h-5" />
+	</button>
+
+	<!-- Checkpoints -->
+	<button 
+		on:click={() => $showCheckpointsPanel = !$showCheckpointsPanel}
+		class="activity-btn {$showCheckpointsPanel ? 'active' : ''}"
+		title="File Checkpoints">
+		<Undo2 class="w-5 h-5" />
 	</button>
 	
 	<!-- Settings -->
