@@ -47,10 +47,14 @@ def get_mcp_tools(workspace: str | None = None) -> MCPTools:
     return MCPTools(path)
 
 
-def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
+def extract_tool_calls(text: str, log_results: bool = False) -> list[tuple[dict, int, int]]:
     """Extract tool calls from model response with their positions.
     
     Uses multiple strategies to find tool calls in model output.
+    
+    Args:
+        text: The model response text to parse
+        log_results: Whether to log extraction results (only set True for final extraction)
     
     Returns list of tuples: (tool_call_dict, start_index, end_index)
     """
@@ -101,30 +105,28 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
                                     # Check if already found
                                     already_found = any(tc[1] == start for tc in tool_calls)
                                     if not already_found:
-                                        logger.info("Found tool call", tool=tool_call.get("tool"), start=start, end=j+1)
                                         tool_calls.append((tool_call, start, j+1))
-                            except json.JSONDecodeError as e:
-                                logger.warning("JSON decode failed", error=str(e), json_preview=json_str[:100])
+                            except json.JSONDecodeError:
+                                pass  # Silent - will retry on next check
                             break
                 j += 1
             
             # Check if we reached the end without finding closing brace (truncated JSON)
             if j >= len(text) and brace_count > 0:
                 truncation_detected = True
-                # Extract tool name from the truncated JSON for logging
-                tool_name_match = re.search(r'"tool"\s*:\s*"([^"]+)"', text[start:])
-                tool_name = tool_name_match.group(1) if tool_name_match else "unknown"
-                logger.warning(
-                    "TRUNCATED JSON DETECTED - model output was cut off",
-                    tool=tool_name,
-                    brace_depth=brace_count,
-                    text_length=len(text),
-                    hint="Model likely hit max_tokens limit. The output was truncated before the JSON could complete."
-                )
+                if log_results:
+                    tool_name_match = re.search(r'"tool"\s*:\s*"([^"]+)"', text[start:])
+                    tool_name = tool_name_match.group(1) if tool_name_match else "unknown"
+                    logger.warning(
+                        "TRUNCATED JSON DETECTED - model output was cut off",
+                        tool=tool_name,
+                        brace_depth=brace_count,
+                        text_length=len(text),
+                        hint="Model likely hit max_tokens limit."
+                    )
     
     # Strategy 2: Try to find JSON objects that look like tool calls using simple search
     if not tool_calls:
-        # Get tool names dynamically from registry
         from prometheus.services.tool_registry import get_registry
         
         registry = get_registry()
@@ -135,10 +137,8 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
                 idx = text.find(f'"tool":"{tool_name}"')
             
             if idx != -1:
-                # Find the opening brace before this
                 brace_start = text.rfind('{', 0, idx)
                 if brace_start != -1:
-                    # Find matching closing brace
                     j = brace_start
                     brace_count = 0
                     in_string = False
@@ -168,23 +168,18 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
                                         if "tool" in tool_call and "args" in tool_call:
                                             already_found = any(tc[1] == brace_start for tc in tool_calls)
                                             if not already_found:
-                                                logger.info("Found tool call (strategy 2)", tool=tool_call.get("tool"))
                                                 tool_calls.append((tool_call, brace_start, j+1))
                                     except json.JSONDecodeError:
                                         pass
                                     break
                         j += 1
     
-    if truncation_detected and not tool_calls:
-        logger.error(
-            "Tool extraction failed due to truncation",
-            found=0,
-            truncated=True,
-            text_preview=text[:200] if text else "",
-            hint="Model output was truncated. Increase max_tokens or simplify the task."
-        )
-    else:
-        logger.info("Tool extraction complete", found=len(tool_calls), text_preview=text[:200] if text else "")
+    # Only log on final extraction (not during streaming checks)
+    if log_results:
+        if truncation_detected and not tool_calls:
+            logger.error("Tool extraction failed due to truncation", found=0)
+        elif tool_calls:
+            logger.info("Tool extraction complete", found=len(tool_calls), tools=[tc[0].get("tool") for tc in tool_calls])
     
     return tool_calls
 
@@ -372,7 +367,14 @@ CRITICAL RULES:
 3. Use read_diagnostics AFTER EVERY EDIT - this is mandatory
 4. Don't say "I'll do X" without actually doing it - include the tool call
 5. After reading 1-2 files, START EDITING. Don't over-analyze.
-6. Complete the task fully before summarizing""".format(tools_text=tools_text)
+6. Complete the task fully before summarizing
+
+⚠️ FILE SIZE LIMITS:
+When writing or creating files, keep each file under 200 lines. If a file needs to be larger:
+- Write the core/skeleton first with placeholder comments
+- Add functionality in separate tool calls
+- Split large files into multiple smaller modules
+NEVER output a single file with 500+ lines - it will timeout and fail!""".format(tools_text=tools_text)
 
     # Inject user-defined rules
     rules_text = await get_enabled_rules_text(request.workspace_path or "")
@@ -408,7 +410,7 @@ CRITICAL RULES:
 
         # Maintain conversation state (use compressed messages)
         current_messages = messages_to_use.copy()
-        max_iterations = 50  # Allow enough iterations to complete complex tasks (large files, multi-step operations)
+        max_iterations = 50  # Blocking logic prevents infinite loops, so 50 iterations is sufficient
         iteration = 0
         lazy_kick_count = 0  # Track how many times we've kicked the agent for being lazy
         max_lazy_kicks = 3  # Don't kick more than 3 times per iteration to avoid infinite loops
@@ -421,6 +423,11 @@ CRITICAL RULES:
         max_reads_before_block = 5  # After this many, REFUSE more reads and force edit
         task_started = False  # Track if the agent has started working on the task
         files_read = set()  # Track which files have been read to prevent re-reading
+        file_read_attempts: dict[str, int] = {}  # Track how many times agent tried to read SAME file
+        total_blocked_reads = 0  # Total blocked read attempts across all files
+        max_blocked_reads = 10  # Abort conversation after this many blocked reads
+        consecutive_blocked_reads = 0  # Track consecutive blocks without progress
+        max_consecutive_blocked = 3  # Abort if agent makes 3 blocked reads in a row
         
         # Cross-iteration deduplication for edits (prevent same edit being made multiple times)
         completed_edits = set()  # Track (path, start_line, end_line, content_hash) tuples
@@ -432,14 +439,15 @@ CRITICAL RULES:
         # Helper to execute a single tool and yield results
         async def execute_and_yield_tool(tool_call: dict) -> tuple[str, dict, str, dict]:
             """Execute a tool call and yield results to frontend. Returns (result_text, result_dict)."""
-            nonlocal completed_edits, read_only_operations, edit_operations, files_read
+            nonlocal completed_edits, read_only_operations, edit_operations, files_read, file_read_attempts, total_blocked_reads, consecutive_blocked_reads
             
             tool_name = tool_call.get("tool")
             args = tool_call.get("args", {})
             
             # Block read operations if agent is in analysis paralysis mode
+            # NOTE: read_diagnostics is excluded - it verifies code correctness and should always be allowed
             read_tools = {'filesystem_read', 'grep', 'filesystem_list', 'filesystem_search',
-                          'codebase_search', 'glob_search', 'read_diagnostics'}
+                          'codebase_search', 'glob_search'}
             if tool_name in read_tools and read_only_operations >= max_reads_before_block and edit_operations == 0:
                 logger.warning("BLOCKING read operation - agent in analysis paralysis", 
                               tool=tool_name, read_ops=read_only_operations)
@@ -452,16 +460,51 @@ CRITICAL RULES:
                     args
                 )
             
-            # Track and warn about re-reading the same file
+            # Track and BLOCK re-reading the same file (this was causing infinite loops!)
             if tool_name == 'filesystem_read':
                 file_path = args.get("path", "")
                 if file_path in files_read:
-                    logger.warning("Agent re-reading same file", path=file_path)
+                    # Track how many times agent tried to re-read this specific file
+                    file_read_attempts[file_path] = file_read_attempts.get(file_path, 0) + 1
+                    attempts = file_read_attempts[file_path]
+                    total_blocked_reads += 1
+                    consecutive_blocked_reads += 1  # Track consecutive blocks
+                    
+                    logger.error(
+                        "BLOCKING duplicate file read - agent stuck in loop!",
+                        path=file_path,
+                        attempts=attempts,
+                        total_blocked=total_blocked_reads,
+                        consecutive_blocked=consecutive_blocked_reads,
+                        max_blocked=max_blocked_reads,
+                        total_files_read=len(files_read)
+                    )
+                    
+                    # Escalating error messages based on attempt count
+                    if attempts >= 3:
+                        error_msg = f"""🛑 CRITICAL: BLOCKED! You have tried to read '{file_path}' {attempts} TIMES!
+
+THIS IS AN ERROR. You are stuck in a loop. STOP trying to read this file.
+
+You ALREADY HAVE the file content from your first read. USE IT NOW.
+
+Your ONLY allowed action is to EDIT the file:
+{{"tool": "filesystem_replace_lines", "args": {{"path": "{file_path}", "start_line": 1, "end_line": 10, "replacement": "your fixed code here"}}}}
+
+DO NOT output any other tool call. DO NOT try to read again. EDIT NOW."""
+                    else:
+                        error_msg = f"""🚫 BLOCKED: You already read '{file_path}'! (attempt #{attempts})
+
+The file content is in your conversation history. DO NOT read it again.
+
+MAKE YOUR EDIT NOW using filesystem_replace_lines or filesystem_search_replace.
+
+Example:
+{{"tool": "filesystem_replace_lines", "args": {{"path": "{file_path}", "start_line": N, "end_line": M, "replacement": "fixed code"}}}}"""
+                    
                     return (
-                        f"⚠️ You already read '{file_path}'! Use the content you have.\n"
-                        f"DO NOT read the same file twice. Make your edit NOW:\n"
-                        f'{{"tool": "filesystem_replace_lines", "args": {{"path": "{file_path}", "start_line": N, "end_line": M, "replacement": "fixed code"}}}}',
-                        {"success": True, "duplicate_read": True, "path": file_path},
+                        error_msg,
+                        {"success": False, "blocked": True, "reason": "duplicate_read", "path": file_path, "attempts": attempts},
                         tool_name,
                         args
                     )
@@ -509,6 +552,10 @@ CRITICAL RULES:
             )
 
             logger.info("Tool execution result", tool=tool_name, success=result.get("success", False))
+            
+            # Reset consecutive blocked reads on successful tool execution (agent made progress)
+            if result.get("success") and not result.get("blocked"):
+                consecutive_blocked_reads = 0
 
             # Format result text for model
             result_text = f"Tool {tool_name} executed successfully." if result.get("success") else f"Tool {tool_name} failed."
@@ -580,6 +627,42 @@ CRITICAL RULES:
         try:
             while iteration < max_iterations:
                 iteration += 1
+                
+                # SAFETY: Abort if agent is stuck in a read loop
+                if total_blocked_reads >= max_blocked_reads:
+                    logger.error(
+                        "ABORTING: Agent stuck in infinite read loop!",
+                        total_blocked=total_blocked_reads,
+                        files_attempted=list(file_read_attempts.keys()),
+                        iteration=iteration
+                    )
+                    abort_data = json.dumps({
+                        "error": f"Agent stuck in loop: {total_blocked_reads} blocked file re-reads. "
+                                 f"The agent kept trying to read the same files instead of making edits. "
+                                 f"Files: {list(file_read_attempts.keys())[:5]}",
+                        "type": "read_loop_detected",
+                        "blocked_reads": total_blocked_reads
+                    })
+                    yield f"data: {abort_data}\n\n"
+                    break
+                
+                # SAFETY: Also abort on consecutive blocked reads (faster detection)
+                if consecutive_blocked_reads >= max_consecutive_blocked:
+                    logger.error(
+                        "ABORTING: Agent making consecutive blocked reads!",
+                        consecutive_blocked=consecutive_blocked_reads,
+                        total_blocked=total_blocked_reads,
+                        iteration=iteration
+                    )
+                    abort_data = json.dumps({
+                        "error": f"Agent stuck: {consecutive_blocked_reads} consecutive blocked reads. "
+                                 f"The agent is not making progress. Consider breaking down the task.",
+                        "type": "no_progress_detected",
+                        "consecutive_blocks": consecutive_blocked_reads
+                    })
+                    yield f"data: {abort_data}\n\n"
+                    break
+                
                 accumulated_response = ""
                 accumulated_reasoning = ""
                 reasoning_complete = False
@@ -626,6 +709,12 @@ CRITICAL RULES:
                 # Track if we received any chunks from the model
                 chunks_received = 0
 
+                # Track if we've detected a tool call being generated
+                detected_tool_in_progress = None
+                last_progress_update = 0
+                last_file_preview_update = 0
+                last_preview_content_length = 0
+                
                 async for chunk in model_router.stream(
                     model=request.model,
                     messages=current_messages,
@@ -633,6 +722,262 @@ CRITICAL RULES:
                     api_key=api_key_to_use,
                 ):
                     chunks_received += 1
+                    
+                    # Try to detect tool being generated (check frequently for early preview)
+                    # For reasoning models, check BOTH accumulated_response AND accumulated_reasoning
+                    content_to_check = accumulated_response
+                    if model_is_reasoning and accumulated_reasoning:
+                        content_to_check = accumulated_reasoning + accumulated_response
+                    
+                    if detected_tool_in_progress is None and '{"tool"' in content_to_check:
+                        # Extract the tool name from the content
+                        tool_match = re.search(r'\{"tool"\s*:\s*"([^"]+)"', content_to_check)
+                        if tool_match:
+                            detected_tool_in_progress = tool_match.group(1)
+                            logger.info("Tool generation detected", tool=detected_tool_in_progress, chunks=chunks_received,
+                                       in_reasoning=('{"tool"' in accumulated_reasoning if accumulated_reasoning else False))
+                            
+                            # Send early preview for file write tools
+                            if detected_tool_in_progress in ["filesystem_write", "filesystem_replace_lines", "filesystem_search_replace", "filesystem_insert"]:
+                                # Try to get the file path early (check both response and reasoning)
+                                path_match = re.search(r'"path"\s*:\s*"([^"]+)"', content_to_check)
+                                file_path = path_match.group(1) if path_match else "..."
+                                
+                                # Detect language from file extension
+                                ext = file_path.rsplit('.', 1)[-1] if '.' in file_path else ''
+                                lang_map = {'py': 'python', 'js': 'javascript', 'ts': 'typescript', 'jsx': 'javascript', 'tsx': 'typescript', 'rs': 'rust', 'go': 'go', 'java': 'java', 'cpp': 'cpp', 'c': 'c', 'rb': 'ruby', 'php': 'php', 'swift': 'swift', 'kt': 'kotlin', 'scala': 'scala', 'sh': 'bash', 'bash': 'bash', 'zsh': 'bash', 'css': 'css', 'scss': 'scss', 'html': 'html', 'xml': 'xml', 'json': 'json', 'yaml': 'yaml', 'yml': 'yaml', 'md': 'markdown', 'sql': 'sql', 'svelte': 'svelte', 'vue': 'vue'}
+                                detected_language = lang_map.get(ext, 'text')
+                                
+                                early_preview = json.dumps({
+                                    "file_write_preview": {
+                                        "path": file_path,
+                                        "content": f"# Generating {file_path}...\n# Please wait while content streams in...",
+                                        "language": detected_language,
+                                        "is_complete": False,
+                                        "bytes_written": 0
+                                    }
+                                })
+                                yield f"data: {early_preview}\n\n"
+                                logger.info("Sent early file preview", path=file_path, language=detected_language)
+                                # Force immediate preview check on next iteration
+                                last_file_preview_update = 0
+                    
+                    # Send progress updates to frontend every 200 chunks so user knows agent is working
+                    if chunks_received - last_progress_update >= 200:
+                        last_progress_update = chunks_received
+                        
+                        # Send progress event to frontend
+                        status_msg = "Generating response..."
+                        if detected_tool_in_progress:
+                            if "write" in detected_tool_in_progress.lower():
+                                status_msg = f"Writing file content..."
+                            elif "replace" in detected_tool_in_progress.lower():
+                                status_msg = f"Preparing code changes..."
+                            else:
+                                status_msg = f"Preparing {detected_tool_in_progress}..."
+                        
+                        stream_progress = json.dumps({
+                            "stream_progress": {
+                                "chunks": chunks_received,
+                                "response_length": len(accumulated_response),
+                                "status": status_msg,
+                                "tool_in_progress": detected_tool_in_progress
+                            }
+                        })
+                        yield f"data: {stream_progress}\n\n"
+                        
+                        logger.info(
+                            "Model streaming progress",
+                            iteration=iteration,
+                            chunks=chunks_received,
+                            response_length=len(accumulated_response),
+                            detected_tool=detected_tool_in_progress
+                        )
+                    
+                    # Stream file write preview if we're generating a file write tool
+                    # Check EVERY 5 chunks for smoother real-time animation (was 10)
+                    # Also check if we have content growing even if tool not detected yet
+                    should_check_preview = (
+                        chunks_received - last_file_preview_update >= 5 and 
+                        detected_tool_in_progress in ["filesystem_write", "filesystem_replace_lines", "filesystem_search_replace", "filesystem_insert"]
+                    )
+                    
+                    # For reasoning models, also check for content patterns even before tool is detected
+                    # This enables preview to start as soon as file content appears
+                    if not should_check_preview and model_is_reasoning and chunks_received - last_file_preview_update >= 5:
+                        combined_content = (accumulated_reasoning or "") + (accumulated_response or "")
+                        # Check for content field starting to be written
+                        if '"content"' in combined_content or '"replacement"' in combined_content:
+                            # Try to detect tool name if not already detected
+                            if detected_tool_in_progress is None:
+                                tool_match = re.search(r'"tool"\s*:\s*"([^"]+)"', combined_content)
+                                if tool_match:
+                                    detected_tool_in_progress = tool_match.group(1)
+                                    logger.info("Late tool detection for preview", tool=detected_tool_in_progress)
+                            if detected_tool_in_progress in ["filesystem_write", "filesystem_replace_lines", "filesystem_search_replace", "filesystem_insert"]:
+                                should_check_preview = True
+                    
+                    if should_check_preview:
+                        # For reasoning models, check both response and reasoning content
+                        preview_content_source = accumulated_response
+                        if model_is_reasoning and accumulated_reasoning:
+                            preview_content_source = accumulated_reasoning + accumulated_response
+                        
+                        # Try to extract file path and partial content from the response
+                        path_match = re.search(r'"path"\s*:\s*"([^"]+)"', preview_content_source)
+                        
+                        # Better content extraction - find the start of content or replacement and grab everything after
+                        content_start = preview_content_source.find('"content"')
+                        replacement_start = preview_content_source.find('"replacement"')
+                        # Also check for "new_content" used by search_replace
+                        new_content_start = preview_content_source.find('"new_content"')
+                        
+                        # Use whichever field is present (content for write, replacement/new_content for edit)
+                        if content_start != -1:
+                            field_start = content_start
+                            field_name_len = 9  # len('"content"')
+                        elif replacement_start != -1:
+                            field_start = replacement_start
+                            field_name_len = 13  # len('"replacement"')
+                        elif new_content_start != -1:
+                            field_start = new_content_start
+                            field_name_len = 13  # len('"new_content"')
+                        else:
+                            field_start = -1
+                            field_name_len = 0
+                        
+                        # Log when we can't find expected patterns (debugging)
+                        if chunks_received % 100 == 0 and (not path_match or field_start == -1):
+                            logger.debug(
+                                "File preview: waiting for content pattern",
+                                has_path=bool(path_match),
+                                field_start=field_start,
+                                source_len=len(preview_content_source),
+                                has_content_field=('"content"' in preview_content_source),
+                                has_replacement_field=('"replacement"' in preview_content_source),
+                                tool=detected_tool_in_progress
+                            )
+                        
+                        if path_match and field_start != -1:
+                            file_path = path_match.group(1)
+                            
+                            # More robust content extraction using regex to find the content value
+                            # This handles various JSON formatting (spaces, no spaces, etc.)
+                            field_names = ['"content"', '"replacement"', '"new_content"']
+                            field_name = field_names[0] if content_start != -1 else (field_names[1] if replacement_start != -1 else field_names[2])
+                            
+                            # Use regex to find the field and its value start
+                            # Match: "content" followed by optional whitespace, colon, optional whitespace, and opening quote
+                            content_pattern = re.escape(field_name) + r'\s*:\s*"'
+                            content_match = re.search(content_pattern, preview_content_source)
+                            
+                            if content_match:
+                                # raw_content starts right after the opening quote
+                                raw_content = preview_content_source[content_match.end():]
+                                
+                                # FIX: Some models output malformed JSON with extra quotes at the start
+                                # e.g., "content": """actual content..." (triple quotes)
+                                # Skip leading quotes to find the actual content
+                                skip_count = 0
+                                while skip_count < len(raw_content) and raw_content[skip_count] == '"':
+                                    skip_count += 1
+                                if skip_count > 0:
+                                    raw_content = raw_content[skip_count:]
+                                    if chunks_received < 10:
+                                        logger.info(
+                                            "Skipped leading quotes in content",
+                                            skip_count=skip_count,
+                                            new_start=repr(raw_content[:50]) if len(raw_content) > 50 else repr(raw_content)
+                                        )
+                                
+                                # Debug: log the first few characters of raw_content every 100 chunks
+                                if chunks_received % 100 == 0 or chunks_received < 10:
+                                    logger.info(
+                                        "Raw content extraction debug",
+                                        raw_start=repr(raw_content[:80]) if len(raw_content) > 80 else repr(raw_content),
+                                        raw_len=len(raw_content),
+                                        match_end=content_match.end(),
+                                        match_group=content_match.group()
+                                    )
+                                
+                                # Parse the JSON string, handling escape sequences
+                                # NOTE: For streaming preview, we DON'T try to detect the end of the JSON string
+                                # because code content has quotes, braces, commas that look like JSON endings.
+                                # We just accumulate everything for the live preview - it's not meant to be perfect.
+                                partial_content = ""
+                                i = 0
+                                while i < len(raw_content):
+                                    if raw_content[i] == '\\' and i + 1 < len(raw_content):
+                                        # Handle escape sequences
+                                        next_char = raw_content[i + 1]
+                                        if next_char == 'n':
+                                            partial_content += '\n'
+                                        elif next_char == 't':
+                                            partial_content += '\t'
+                                        elif next_char == '"':
+                                            partial_content += '"'
+                                        elif next_char == '\\':
+                                            partial_content += '\\'
+                                        elif next_char == 'r':
+                                            pass  # Skip \r
+                                        else:
+                                            partial_content += raw_content[i:i+2]
+                                        i += 2
+                                    elif raw_content[i] == '"':
+                                        # For streaming preview, treat unescaped quotes as literal quotes
+                                        # The model often doesn't escape quotes in code content
+                                        # We'll include them and continue accumulating
+                                        partial_content += '"'
+                                        i += 1
+                                    else:
+                                        partial_content += raw_content[i]
+                                        i += 1
+                                
+                                # Log the extraction progress every 50 chunks for better debugging
+                                if chunks_received % 50 == 0:
+                                    # Also log first few parsed chars to debug issues
+                                    first_char = repr(raw_content[0]) if raw_content else "EMPTY"
+                                    logger.info(
+                                        "File preview extraction progress",
+                                        path=file_path,
+                                        content_len=len(partial_content),
+                                        last_len=last_preview_content_length,
+                                        raw_len=len(raw_content),
+                                        first_char=first_char,
+                                        partial_preview=repr(partial_content[:30]) if partial_content else "EMPTY",
+                                        is_reasoning=model_is_reasoning,
+                                        reasoning_len=len(accumulated_reasoning) if accumulated_reasoning else 0
+                                    )
+                                
+                                # Send if content has grown (at least 15 chars for more responsive updates)
+                                # Reduced from 30 to be more real-time
+                                if len(partial_content) > last_preview_content_length + 15:
+                                    last_file_preview_update = chunks_received
+                                    last_preview_content_length = len(partial_content)
+                                    
+                                    # Detect language from file extension
+                                    ext = file_path.rsplit('.', 1)[-1] if '.' in file_path else ''
+                                    lang_map = {'py': 'python', 'js': 'javascript', 'ts': 'typescript', 'jsx': 'javascript', 'tsx': 'typescript', 'rs': 'rust', 'go': 'go', 'java': 'java', 'cpp': 'cpp', 'c': 'c', 'rb': 'ruby', 'php': 'php', 'swift': 'swift', 'kt': 'kotlin', 'scala': 'scala', 'sh': 'bash', 'bash': 'bash', 'zsh': 'bash', 'css': 'css', 'scss': 'scss', 'html': 'html', 'xml': 'xml', 'json': 'json', 'yaml': 'yaml', 'yml': 'yaml', 'md': 'markdown', 'sql': 'sql', 'svelte': 'svelte', 'vue': 'vue'}
+                                    language = lang_map.get(ext, 'text')
+                                    
+                                    logger.info(
+                                        "Sending file preview update",
+                                        path=file_path,
+                                        content_len=len(partial_content),
+                                        language=language,
+                                        chunks=chunks_received
+                                    )
+                                    file_preview = json.dumps({
+                                        "file_write_preview": {
+                                            "path": file_path,
+                                            "content": partial_content,
+                                            "language": language,
+                                            "is_complete": False,
+                                            "bytes_written": len(partial_content)
+                                        }
+                                    })
+                                    yield f"data: {file_preview}\n\n"
+                    
                     if chunk.choices and chunk.choices[0].delta:
                         delta = chunk.choices[0].delta
 
@@ -641,8 +986,20 @@ CRITICAL RULES:
                             reasoning_chunk = delta.provider_specific_fields.get("reasoning_content", "")
                             if reasoning_chunk:
                                 accumulated_reasoning += reasoning_chunk
+                                # Log first reasoning chunk to confirm it's working
+                                if len(accumulated_reasoning) == len(reasoning_chunk):
+                                    logger.info("Started receiving reasoning content from model", model=request.model)
                                 thinking_data = json.dumps({"thinking_chunk": reasoning_chunk})
                                 yield f"data: {thinking_data}\n\n"
+                        
+                        # ALSO check for reasoning_content directly on delta (some LiteLLM versions)
+                        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                            reasoning_chunk = delta.reasoning_content
+                            accumulated_reasoning += reasoning_chunk
+                            if len(accumulated_reasoning) == len(reasoning_chunk):
+                                logger.info("Started receiving reasoning_content (direct attr)", model=request.model)
+                            thinking_data = json.dumps({"thinking_chunk": reasoning_chunk})
+                            yield f"data: {thinking_data}\n\n"
 
                         # Handle regular content
                         if delta.content:
@@ -754,10 +1111,23 @@ CRITICAL RULES:
                             # 1. If not in JSON and buffer has content, check for complete tool calls
                             # 2. Stream safe content (everything before tool calls)
                             # 3. Hold back potential JSON until we confirm it's a tool call or not
+                            # 4. For reasoning models, also check reasoning content for tool calls!
 
                             if not in_potential_json or brace_depth == 0:
                                 # We're outside JSON or just closed a brace - safe to check for tools
+                                # Check BOTH regular response AND reasoning content for tool calls
+                                # DeepSeek Reasoner often puts tool calls in its thinking
                                 tool_calls = extract_tool_calls(accumulated_response)
+                                
+                                # For reasoning models, ALSO check reasoning content for tool calls
+                                if model_is_reasoning and accumulated_reasoning:
+                                    reasoning_tool_calls = extract_tool_calls(accumulated_reasoning)
+                                    if reasoning_tool_calls:
+                                        logger.info("Found tool calls in reasoning content!", count=len(reasoning_tool_calls))
+                                        # Merge with regular tool calls (adjust positions to indicate they're from reasoning)
+                                        for tc, start, end in reasoning_tool_calls:
+                                            # Use negative positions to indicate from reasoning
+                                            tool_calls.append((tc, -1, -1))
 
                                 # Calculate what's safe to stream (everything up to first unprocessed tool call)
                                 safe_end = len(accumulated_response)
@@ -867,9 +1237,34 @@ CRITICAL RULES:
 
                 # After streaming completes, stream any remaining buffered content
                 # (strip out any tool calls that might be in the buffer)
+                
+                # CRITICAL: For reasoning models, do a FINAL check for tool calls in reasoning content
+                # DeepSeek Reasoner often finishes thinking before emitting tool calls
+                if model_is_reasoning and accumulated_reasoning and not tool_calls_found:
+                    logger.info("Reasoning model finished - checking reasoning for tool calls", 
+                               reasoning_length=len(accumulated_reasoning))
+                    reasoning_tool_calls = extract_tool_calls(accumulated_reasoning, log_results=True)
+                    for tool_call, start, end in reasoning_tool_calls:
+                        tool_signature = json.dumps(tool_call, sort_keys=True)
+                        if tool_signature not in processed_tool_signatures:
+                            processed_tool_signatures.add(tool_signature)
+                            # Send tool call notification to frontend
+                            tool_call_notification = json.dumps({
+                                "tool_call": {
+                                    "tool": tool_call.get("tool"),
+                                    "args": tool_call.get("args"),
+                                }
+                            })
+                            yield f"data: {tool_call_notification}\n\n"
+                            logger.info("Tool call found in reasoning content (post-stream)", tool=tool_call.get("tool"))
+                            tool_calls_found.append({
+                                "call": tool_call,
+                                "signature": tool_signature
+                            })
+                
                 if stream_buffer.strip():
-                    # Check one final time for tool calls in the buffer
-                    final_tool_calls = extract_tool_calls(accumulated_response)
+                    # Check one final time for tool calls in the buffer (with logging)
+                    final_tool_calls = extract_tool_calls(accumulated_response, log_results=True)
                     buffer_start_pos = len(accumulated_response) - len(stream_buffer)
 
                     # Find if there are any tool calls in the buffer range
@@ -905,6 +1300,26 @@ CRITICAL RULES:
                         token_data = json.dumps({"token": clean_buffer.strip()})
                         yield f"data: {token_data}\n\n"
 
+                # Log stream completion with comprehensive info for debugging
+                logger.info(
+                    "Model stream completed",
+                    iteration=iteration,
+                    chunks_received=chunks_received,
+                    response_length=len(accumulated_response),
+                    reasoning_length=len(accumulated_reasoning),
+                    tool_calls_found=len(tool_calls_found),
+                    is_reasoning_model=model_is_reasoning,
+                    model=request.model
+                )
+                
+                # Debug: If no tool calls found but we have accumulated content, log it
+                if not tool_calls_found and (accumulated_response or accumulated_reasoning):
+                    logger.warning(
+                        "No tool calls extracted from model output",
+                        response_preview=accumulated_response[:500] if accumulated_response else "empty",
+                        reasoning_preview=accumulated_reasoning[:500] if accumulated_reasoning else "empty"
+                    )
+
                 # ========== HANDLE STREAM TIMEOUT/FAILURE ==========
                 # If we didn't receive any chunks, the stream likely timed out or failed silently
                 if chunks_received == 0:
@@ -939,8 +1354,7 @@ CRITICAL RULES:
                     yield f"data: {stream_warning}\n\n"
                     
                     # Add a brief delay before retrying to avoid hammering the API
-                    import asyncio as aio
-                    await aio.sleep(2.0 * empty_stream_retries)  # Exponential backoff
+                    await asyncio.sleep(2.0 ** empty_stream_retries)  # Exponential backoff: 2s, 4s, 8s
                     
                     # Continue to next iteration (retry the model call)
                     continue
@@ -949,26 +1363,51 @@ CRITICAL RULES:
                     empty_stream_retries = 0
 
                 # ========== PARALLEL TOOL EXECUTION ==========
-                # Execute all collected tool calls in parallel
+                # Execute all collected tool calls in parallel (with limits)
                 if tool_calls_found:
                     import asyncio
                     
-                    logger.info("Executing tool calls in parallel", count=len(tool_calls_found))
+                    MAX_CONCURRENT_TOOLS = 3  # Limit concurrent tool execution
+                    TOOL_TIMEOUT_SECONDS = 60  # Timeout per tool
                     
-                    # Create tasks for all tool calls
+                    logger.info("Executing tool calls", count=len(tool_calls_found), max_concurrent=MAX_CONCURRENT_TOOLS)
+                    
+                    # Semaphore to limit concurrency
+                    semaphore = asyncio.Semaphore(MAX_CONCURRENT_TOOLS)
+                    
+                    # Create tasks for all tool calls with semaphore and timeout
                     async def execute_single_tool(tc_info):
-                        """Execute a single tool and return result with metadata."""
+                        """Execute a single tool with concurrency limit and timeout."""
                         tool_call = tc_info["call"]
-                        result_text, result, tool_name, args = await execute_and_yield_tool(tool_call)
-                        return {
-                            "tool_call": tool_call,
-                            "result_text": result_text,
-                            "result": result,
-                            "tool_name": tool_name,
-                            "args": args
-                        }
+                        tool_name = tool_call.get("tool", "unknown")
+                        
+                        async with semaphore:
+                            try:
+                                logger.debug("Starting tool execution", tool=tool_name)
+                                result_text, result, tool_name, args = await asyncio.wait_for(
+                                    execute_and_yield_tool(tool_call),
+                                    timeout=TOOL_TIMEOUT_SECONDS
+                                )
+                                logger.debug("Tool execution completed", tool=tool_name)
+                                return {
+                                    "tool_call": tool_call,
+                                    "result_text": result_text,
+                                    "result": result,
+                                    "tool_name": tool_name,
+                                    "args": args
+                                }
+                            except asyncio.TimeoutError:
+                                logger.error("Tool execution timed out", tool=tool_name, timeout=TOOL_TIMEOUT_SECONDS)
+                                return {
+                                    "tool_call": tool_call,
+                                    "result_text": f"Tool {tool_name} timed out after {TOOL_TIMEOUT_SECONDS} seconds",
+                                    "result": {"success": False, "error": f"Timeout after {TOOL_TIMEOUT_SECONDS}s"},
+                                    "tool_name": tool_name,
+                                    "args": tool_call.get("args", {}),
+                                    "timed_out": True
+                                }
                     
-                    # Execute all tools in parallel
+                    # Execute all tools in parallel (limited by semaphore)
                     tasks = [execute_single_tool(tc) for tc in tool_calls_found]
                     parallel_results = await asyncio.gather(*tasks, return_exceptions=True)
                     
@@ -979,6 +1418,26 @@ CRITICAL RULES:
                             tool_results.append({
                                 "tool": "unknown",
                                 "result": f"Tool execution failed: {str(pr)}"
+                            })
+                            continue
+                        
+                        # Handle timed out tools
+                        if pr.get("timed_out"):
+                            tool_name = pr["tool_name"]
+                            args = pr["args"]
+                            timeout_data = json.dumps({
+                                "tool_execution": {
+                                    "tool": tool_name,
+                                    "args": args,
+                                    "success": False,
+                                    "error": pr["result_text"],
+                                    "timed_out": True
+                                }
+                            })
+                            yield f"data: {timeout_data}\n\n"
+                            tool_results.append({
+                                "tool": tool_name,
+                                "result": pr["result_text"]
                             })
                             continue
                         
@@ -1020,10 +1479,34 @@ CRITICAL RULES:
                                 "diff": result.get("diff"),
                                 "error": result.get("error"),
                                 "return_code": result.get("return_code"),
-                                "hint": result.get("hint")
+                                "hint": result.get("hint"),
+                                "verified": result.get("verified")  # Include verification flag
                             }
                         })
                         yield f"data: {tool_data}\n\n"
+                        
+                        # Send file_write_complete event for file write tools after actual execution
+                        if tool_name in ["filesystem_write", "filesystem_replace_lines", "filesystem_search_replace", "filesystem_insert"]:
+                            if result.get("success"):
+                                logger.info("File write completed and verified", 
+                                          tool=tool_name, 
+                                          path=result.get("path"),
+                                          verified=result.get("verified", False))
+                                file_complete_data = json.dumps({
+                                    "file_write_complete": {
+                                        "tool": tool_name,
+                                        "path": result.get("path"),
+                                        "action": result.get("action"),
+                                        "verified": result.get("verified", False),
+                                        "success": True
+                                    }
+                                })
+                                yield f"data: {file_complete_data}\n\n"
+                            else:
+                                logger.warning("File write failed", 
+                                             tool=tool_name, 
+                                             path=result.get("path"),
+                                             error=result.get("error"))
                         
                         tool_results.append({
                             "tool": tool_name,

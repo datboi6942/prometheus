@@ -21,6 +21,8 @@
 	import DiffViewer from '$lib/components/chat/DiffViewer.svelte';
 	import ThinkingBlock from '$lib/components/chat/ThinkingBlock.svelte';
 	import ToolExecutionCard from '$lib/components/chat/ToolExecutionCard.svelte';
+	import FilePreviewPanel from '$lib/components/chat/FilePreviewPanel.svelte';
+	import ChatMessage from '$lib/components/chat/ChatMessage.svelte';
 	import IndexingProgressBar from '$lib/components/ui/IndexingProgressBar.svelte';
 
 	// Import stores
@@ -34,7 +36,8 @@
 		messages, chatInput, isLoading, isConnected, abortController,
 		currentOpenFile, editorHasUnsavedChanges, toolExecutions, activeToolCalls,
 		gitStatus, gitBranches, gitCommits, isGitRepo, githubAuthenticated, githubUser,
-		contextInfo, activeThinking, iterationProgress, iterationWarning, agentStatus, reasoningWarning
+		contextInfo, activeThinking, iterationProgress, iterationWarning, agentStatus, reasoningWarning,
+		streamingStatus, activeFilePreview
 	} from '$lib/stores';
 	
 	// Import API functions
@@ -182,6 +185,47 @@
 
 			activeCodeAnimations = new Map(activeCodeAnimations); // Create new Map to trigger reactivity
 		}, 100);
+	}
+
+	// Live file preview animation state (for Cursor-like typing effect)
+	let livePreviewDisplayContent = '';
+	let livePreviewTargetContent = '';
+	let livePreviewAnimationFrame: number | null = null;
+	
+	// Reactive animation - smoothly animate content as it streams in
+	$: if ($activeFilePreview) {
+		// CRITICAL FIX: Cancel existing animation before starting new one to prevent multiple concurrent loops
+		if (livePreviewAnimationFrame) {
+			cancelAnimationFrame(livePreviewAnimationFrame);
+			livePreviewAnimationFrame = null;
+		}
+		livePreviewTargetContent = $activeFilePreview.content;
+		// Start new animation
+		animateLivePreview();
+	} else {
+		// Reset when preview is cleared
+		livePreviewDisplayContent = '';
+		livePreviewTargetContent = '';
+		if (livePreviewAnimationFrame) {
+			cancelAnimationFrame(livePreviewAnimationFrame);
+			livePreviewAnimationFrame = null;
+		}
+	}
+	
+	function animateLivePreview() {
+		// Animate characters to catch up with target content
+		const charsToAdd = Math.min(15, livePreviewTargetContent.length - livePreviewDisplayContent.length);
+		
+		if (charsToAdd > 0) {
+			livePreviewDisplayContent = livePreviewTargetContent.slice(0, livePreviewDisplayContent.length + charsToAdd);
+		}
+		
+		// Continue animation if there's more content to display or preview is active
+		if ($activeFilePreview && (livePreviewDisplayContent.length < livePreviewTargetContent.length || $activeFilePreview)) {
+			livePreviewAnimationFrame = requestAnimationFrame(animateLivePreview);
+		} else {
+			livePreviewAnimationFrame = null;
+		}
 	}
 
 	// Diff animations
@@ -707,10 +751,45 @@
 		}
 	}
 
-	// Auto-scroll when messages or tool calls change
-	$: if ($messages || $activeToolCalls) {
+	// Auto-scroll when messages, tool calls, or tool executions change
+	$: if ($messages || $activeToolCalls || $toolExecutions) {
 		scrollToBottom();
 	}
+
+	// Create unified timeline of messages and tool executions for chronological display
+	interface TimelineItem {
+		type: 'message' | 'tool_execution';
+		timestamp: Date;
+		data: any;
+	}
+
+	// Reactive combined timeline - messages and tool executions sorted chronologically
+	$: combinedTimeline = (() => {
+		const items: TimelineItem[] = [];
+		
+		// Add messages
+		for (const msg of $messages) {
+			items.push({
+				type: 'message',
+				timestamp: msg.timestamp,
+				data: msg
+			});
+		}
+		
+		// Add tool executions (only the recent ones to keep UI responsive)
+		for (const exec of $toolExecutions.slice(-20)) {
+			items.push({
+				type: 'tool_execution',
+				timestamp: exec.timestamp,
+				data: exec
+			});
+		}
+		
+		// Sort by timestamp chronologically
+		items.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+		
+		return items;
+	})();
 
 	// Tool call timeout mechanism - remove stuck tool calls after 3 minutes
 	let toolCallTimeouts: Map<string, number> = new Map();
@@ -892,6 +971,8 @@
 			
 			const decoder = new TextDecoder();
 			let currentResponse = '';
+			let lastIteration = 0;  // Track iteration to segment messages
+			let toolsExecutedInIteration = false;  // Track if tools ran in this iteration
 			$messages = [...$messages, { role: 'assistant', content: '', timestamp: new Date() }];
 			
 			while (true) {
@@ -912,10 +993,24 @@
 								$messages[$messages.length - 1].content = currentResponse;
 								$messages = [...$messages];
 							}
+							
+							// Create new message bubble when a new iteration starts AND tools were executed
+							// This groups parallel tool executions properly without breaking on iteration increment
+							if (data.iteration_progress && data.iteration_progress.current > lastIteration) {
+								// Only create new message if tools ran in previous iteration and we have content
+								if (lastIteration > 0 && toolsExecutedInIteration && currentResponse.trim()) {
+									currentResponse = '';
+									$messages = [...$messages, { role: 'assistant', content: '', timestamp: new Date() }];
+								}
+								lastIteration = data.iteration_progress.current;
+								toolsExecutedInIteration = false;  // Reset for new iteration
+							}
 
 							// Handle tool call notifications (tool is being called, not yet executed)
 							if (data.tool_call) {
 								console.log('Tool call initiated:', data.tool_call.tool);
+								$streamingStatus = null;  // Clear streaming status when tool is initiated
+								$activeFilePreview = null;  // Clear file preview when tool starts executing
 								const toolCall = {
 									tool: data.tool_call.tool,
 									args: data.tool_call.args,
@@ -928,6 +1023,7 @@
 							// Handle tool execution notifications (tool execution completed)
 							if (data.tool_execution) {
 								const te = data.tool_execution;
+								toolsExecutedInIteration = true;  // Mark that tools ran in this iteration
 
 								// Remove matching tool call with improved matching logic
 								// Try exact match first, then fallback to tool name only
@@ -956,29 +1052,28 @@
 									path: te.path || te.file,
 									command: te.command,
 									stdout: te.stdout,
-									stderr: te.stderr,
-									status: te.success ? 'success' : 'error',
+									stderr: te.stderr || te.error,
+									status: te.timed_out ? 'timeout' : (te.success ? 'success' : 'error'),
 									timestamp: new Date(),
 									return_code: te.return_code,
 									hint: te.hint,
 									diff: te.diff,
 									args: te.args || {}
 								}];
-								console.log('Tool executed:', te.tool, te.success ? '✓' : '✗');
+								console.log('Tool executed:', te.tool, te.timed_out ? '⏱️ TIMEOUT' : (te.success ? '✓' : '✗'));
 
 								// Smart animation selection for file operations
+								// NOTE: Live file preview (activeFilePreview) now handles real-time streaming
+								// We only show diff animations AFTER the tool completes for modifications
 								if (te.success && te.path) {
-									// For filesystem_write
+									// For filesystem_write - only show diff for modifications (new files already previewed live)
 									if (te.tool === 'filesystem_write') {
-										if (te.action === 'created' && te.content) {
-											// New file → code animation (Python and all others)
-											console.log('Starting code animation for new file:', te.path);
-											startCodeAnimation(te.path, te.content);
-										} else if (te.action === 'modified' && te.diff) {
+										if (te.action === 'modified' && te.diff) {
 											// Modified file → inline diff viewer (Cursor/Claude Code style)
 											console.log('Starting inline diff animation for:', te.path);
 											startDiffAnimation(te.path, te.diff);
 										}
+										// New files are handled by live preview - no need for legacy animation
 									}
 
 									// For targeted editing tools - ALWAYS show inline diff (Cursor/Claude Code style)
@@ -1067,6 +1162,46 @@
 								console.log('Iteration progress:', data.iteration_progress);
 							}
 
+							// Handle stream progress (shows user what agent is doing during long generations)
+							if (data.stream_progress) {
+								console.log('Stream progress:', data.stream_progress);
+								const sp = data.stream_progress;
+								// Update the UI to show streaming status
+								if (sp.tool_in_progress) {
+									$streamingStatus = sp.status;
+								} else if (sp.chunks > 200) {
+									$streamingStatus = `Generating response (${Math.round(sp.response_length / 1000)}k chars)...`;
+								}
+							}
+							
+							// Handle file write preview (shows file content being generated)
+							if (data.file_write_preview) {
+								const fwp = data.file_write_preview;
+								console.log('File write preview:', fwp.path, fwp.bytes_written, 'bytes');
+								$activeFilePreview = {
+									path: fwp.path,
+									content: fwp.content,
+									language: fwp.language,
+									bytesWritten: fwp.bytes_written,
+									isComplete: fwp.is_complete
+								};
+							}
+							
+							// Handle file write complete (actual file write confirmed)
+							if (data.file_write_complete) {
+								const fwc = data.file_write_complete;
+								console.log('File write completed:', fwc.path, 'verified:', fwc.verified);
+								// Only clear preview once we confirm the file was actually written
+								if (fwc.success && $activeFilePreview && $activeFilePreview.path === fwc.path) {
+									// Keep preview visible for a moment then clear
+									setTimeout(() => {
+										if ($activeFilePreview && $activeFilePreview.path === fwc.path) {
+											$activeFilePreview = null;
+										}
+									}, 1000);
+								}
+							}
+
 							// Handle iteration warning (approaching limit)
 							if (data.iteration_warning) {
 								$iterationWarning = data.iteration_warning;
@@ -1150,6 +1285,8 @@
 			$activeThinking = null;
 			$agentStatus = null;
 			$reasoningWarning = null;
+			$streamingStatus = null;  // Clear streaming progress
+			$activeFilePreview = null;  // Clear file preview
 			$isLoading = false;
 			$isConnected = false;
 		}
@@ -1572,43 +1709,23 @@
 				<!-- Chat View -->
 				<div class="flex-1 flex flex-col">
 					<div bind:this={chatMessagesContainer} class="flex-1 overflow-y-auto p-6 space-y-4">
-						{#each $messages as msg}
-							<div class="flex gap-3 {msg.role === 'user' ? 'justify-end' : 'justify-start'}">
-								{#if msg.role !== 'user'}
-									<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center flex-shrink-0">
-										<Sparkles class="w-4 h-4 text-white" />
-									</div>
-								{/if}
-								<div class="max-w-2xl space-y-2">
-									<!-- Thinking Block (for assistant messages with reasoning) -->
-									{#if msg.thinking && msg.role === 'assistant'}
-										<ThinkingBlock
-											summary={msg.thinking.summary}
-											fullContent={msg.thinking.fullContent}
-											isStreaming={false}
-											isExpanded={false}
-										/>
-									{/if}
-
-									<!-- Message Content -->
-									<div class="{msg.role === 'user' ? 'bg-amber-500/10 border-amber-500/30' : 'bg-slate-800/50 border-slate-700/50'} border rounded-xl p-4">
-										{#if msg.content}
-											<div class="text-sm text-slate-200 leading-relaxed markdown-content">
-												{@html formatMessageContent(msg.content)}
-											</div>
-										{/if}
-										<div class="text-[10px] text-slate-500 mt-2">{msg.timestamp.toLocaleTimeString()}</div>
+						<!-- Unified Timeline: Messages and Tool Executions interleaved chronologically -->
+						{#each combinedTimeline as item}
+							{#if item.type === 'message'}
+								{@const msg = item.data}
+								<ChatMessage message={msg} />
+							{:else if item.type === 'tool_execution'}
+								{@const execution = item.data}
+								<div class="flex gap-3 animate-fadeIn">
+									<div class="w-8 h-8 flex-shrink-0"><!-- Spacer for alignment --></div>
+									<div class="max-w-2xl flex-1">
+										<ToolExecutionCard {execution} isActive={false} />
 									</div>
 								</div>
-								{#if msg.role === 'user'}
-									<div class="w-8 h-8 rounded-lg bg-slate-700 flex items-center justify-center flex-shrink-0">
-										<span class="text-xs font-bold">You</span>
-									</div>
-								{/if}
-							</div>
+							{/if}
 						{/each}
 						
-						<!-- Active Thinking (in progress) - show FIRST as it happens before tool calls -->
+						<!-- Active Thinking (in progress) - shows at the END as current activity -->
 						{#if $activeThinking && $activeThinking.isActive}
 							<div class="flex gap-3">
 								<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-blue-600 flex items-center justify-center flex-shrink-0 animate-pulse">
@@ -1625,17 +1742,7 @@
 							</div>
 						{/if}
 
-						<!-- Recent Tool Executions (completed) - show what the agent has done -->
-						{#each $toolExecutions.slice(-10) as execution}
-							<div class="flex gap-3 animate-fadeIn">
-								<div class="w-8 h-8 flex-shrink-0"><!-- Spacer for alignment --></div>
-								<div class="max-w-2xl flex-1">
-									<ToolExecutionCard {execution} isActive={false} />
-								</div>
-							</div>
-						{/each}
-
-						<!-- Active Tool Calls (in progress) - show after completed ones -->
+						<!-- Active Tool Calls (in progress) - shows at the END as current activity -->
 						{#each $activeToolCalls as toolCall}
 							{@const _ = toolCallTickCounter}
 							<div class="flex gap-3 animate-fadeIn">
@@ -1660,33 +1767,38 @@
 						{#if $isLoading}
 							{@const isWarning = $iterationWarning !== null}
 							{@const progressPct = $iterationProgress ? ($iterationProgress.current / $iterationProgress.max) * 100 : 0}
-							<div class="flex gap-3 animate-fadeIn sticky top-0 z-10">
-								<div class="w-8 h-8 rounded-lg bg-gradient-to-br {isWarning ? 'from-red-500 to-orange-600 shadow-red-500/30' : $toolExecutions.length === 0 ? 'from-purple-500 to-blue-600 shadow-purple-500/30' : 'from-amber-500 to-orange-600 shadow-amber-500/30'} flex items-center justify-center shadow-lg">
+							<div class="flex gap-3 animate-fadeIn sticky top-0 z-10 backdrop-blur-sm">
+								<div class="w-8 h-8 rounded-lg bg-gradient-to-br {isWarning ? 'from-red-500 to-orange-600 shadow-red-500/30' : $toolExecutions.length === 0 ? 'from-purple-500 to-blue-600 shadow-purple-500/30' : 'from-amber-500 to-orange-600 shadow-amber-500/30'} flex items-center justify-center shadow-lg animate-pulse">
 									{#if $activeThinking}
-										<Brain class="w-4 h-4 text-white animate-pulse" />
+										<Brain class="w-4 h-4 text-white" />
 									{:else if $activeToolCalls.length > 0}
 										<Loader2 class="w-4 h-4 text-white animate-spin" />
 									{:else}
-										<Brain class="w-4 h-4 text-white animate-pulse" />
+										<Sparkles class="w-4 h-4 text-white" />
 									{/if}
 								</div>
-								<div class="max-w-2xl flex-1 bg-gradient-to-br {isWarning ? 'from-red-500/10 to-orange-500/10 border-red-500/30 ring-red-500/20' : $toolExecutions.length === 0 ? 'from-purple-500/10 to-blue-500/10 border-purple-500/30 ring-purple-500/20' : 'from-amber-500/10 to-orange-500/10 border-amber-500/30 ring-amber-500/20'} border rounded-xl p-4 ring-2">
+								<div class="max-w-2xl flex-1 bg-gradient-to-br {isWarning ? 'from-red-500/10 to-orange-500/10 border-red-500/30 ring-red-500/20 shadow-red-500/10' : $toolExecutions.length === 0 ? 'from-purple-500/10 to-blue-500/10 border-purple-500/30 ring-purple-500/20 shadow-purple-500/10' : 'from-amber-500/10 to-orange-500/10 border-amber-500/30 ring-amber-500/20 shadow-amber-500/10'} border rounded-xl p-4 ring-2 shadow-xl backdrop-blur-sm">
 									<div class="flex items-center justify-between">
-										<div class="flex items-center gap-2">
-											<Loader2 class="w-4 h-4 {isWarning ? 'text-red-400' : $toolExecutions.length === 0 ? 'text-purple-400' : 'text-amber-400'} animate-spin" />
-											<span class="text-sm {isWarning ? 'text-red-300' : $toolExecutions.length === 0 ? 'text-purple-300' : 'text-amber-300'} font-medium">
-												{#if isWarning}
-													⚠️ {$iterationWarning?.message || 'Approaching limit...'}
-												{:else if $activeThinking}
-													🧠 Reasoning...
-												{:else if $activeToolCalls.length > 0}
-													⚡ Executing {$activeToolCalls.length} tool{$activeToolCalls.length > 1 ? 's' : ''}...
-												{:else if $toolExecutions.length === 0}
-													🚀 Processing your request...
-												{:else}
-													🔄 Agent working...
+										<div class="flex items-center gap-3">
+											<Loader2 class="w-5 h-5 {isWarning ? 'text-red-400' : $toolExecutions.length === 0 ? 'text-purple-400' : 'text-amber-400'} animate-spin" />
+											<div class="flex flex-col gap-0.5">
+												<span class="text-sm {isWarning ? 'text-red-300' : $toolExecutions.length === 0 ? 'text-purple-300' : 'text-amber-300'} font-semibold">
+													{#if isWarning}
+														⚠️ {$iterationWarning?.message || 'Approaching limit...'}
+													{:else if $activeThinking}
+														🧠 Reasoning through the problem
+													{:else if $activeToolCalls.length > 0}
+														⚡ Executing {$activeToolCalls.length} tool{$activeToolCalls.length > 1 ? 's' : ''}
+													{:else if $toolExecutions.length === 0}
+														🚀 Processing your request
+													{:else}
+														🔄 Agent working on task
+													{/if}
+												</span>
+												{#if $streamingStatus}
+													<span class="text-[11px] text-slate-400">{$streamingStatus}</span>
 												{/if}
-											</span>
+											</div>
 										</div>
 										<div class="flex items-center gap-2 flex-wrap">
 											{#if $iterationProgress}
@@ -1723,6 +1835,11 @@
 												<span class="w-2 h-2 rounded-full bg-blue-400 animate-pulse"></span>
 												{$activeToolCalls[0]?.tool}: {$activeToolCalls[0]?.args?.path || $activeToolCalls[0]?.args?.pattern || 'processing...'}
 											</span>
+										{:else if $streamingStatus}
+											<span class="flex items-center gap-1.5">
+												<span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+												{$streamingStatus}
+											</span>
 										{:else}
 											<span class="flex items-center gap-1.5">
 												<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
@@ -1744,36 +1861,22 @@
 									</div>
 								</div>
 							</div>
+							
+							<!-- Live File Write Preview - Cursor-like typing animation -->
+							{#if $activeFilePreview}
+								<div class="mt-4">
+									<FilePreviewPanel
+										path={$activeFilePreview.path}
+										displayContent={livePreviewDisplayContent}
+										language={$activeFilePreview.language}
+										bytesWritten={$activeFilePreview.bytesWritten}
+										isComplete={$activeFilePreview.isComplete}
+									/>
+								</div>
+							{/if}
 						{/if}
 
-						<!-- Code Animations -->
-						{#each Array.from(activeCodeAnimations.values()) as animation}
-							<div class="flex gap-3">
-								<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-amber-500 to-orange-600 flex items-center justify-center flex-shrink-0">
-									{#if animation.completed}
-										<Check class="w-4 h-4 text-white" />
-									{:else}
-										<FileCode class="w-4 h-4 text-white animate-pulse" />
-									{/if}
-								</div>
-								<div class="max-w-4xl flex-1 bg-slate-800/50 border border-amber-500/30 rounded-xl overflow-hidden">
-									<div class="bg-slate-900/80 px-4 py-2 border-b border-slate-700/50 flex items-center justify-between">
-										<div class="flex items-center gap-2">
-											<File class="w-3 h-3 text-amber-500" />
-											<span class="text-xs font-mono text-slate-300">{animation.path}</span>
-										</div>
-										<span class="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-400">
-											{animation.completed ? 'Complete' : 'Writing...'}
-										</span>
-									</div>
-									<div class="p-4 bg-slate-950 font-mono text-xs overflow-auto max-h-96">
-										<pre class="text-slate-300 leading-relaxed">{animation.displayedContent}<span class="animate-pulse">|</span></pre>
-									</div>
-								</div>
-							</div>
-						{/each}
-
-						<!-- Diff Animations -->
+						<!-- Diff Animations (shown after file modifications complete) -->
 						{#each Array.from(activeDiffAnimations.values()) as animation}
 							<div class="flex gap-3">
 								<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-fuchsia-600 flex items-center justify-center flex-shrink-0">
@@ -1842,28 +1945,50 @@
 						<div class="flex gap-3">
 							<textarea 
 								bind:value={$chatInput}
-								on:keydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
-								placeholder="Ask Prometheus anything... (Shift+Enter for new line)"
+								on:keydown={(e) => { 
+									if (e.key === 'Enter' && !e.shiftKey) { 
+										e.preventDefault(); 
+										sendMessage(); 
+									} else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+										e.preventDefault();
+										sendMessage();
+									} else if (e.key === 'Escape') {
+										if ($isLoading) {
+											stopGeneration();
+										}
+									}
+								}}
+								placeholder="Ask Prometheus anything... (↵ Send • Shift+↵ New line • Cmd+↵ Send • Esc Stop)"
 								rows="3"
-								class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 text-sm text-slate-200 outline-none focus:border-amber-500 resize-none"
+								class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-3 text-sm text-slate-200 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-500/20 resize-none transition-all"
 								disabled={$isLoading}
 							></textarea>
 							{#if $isLoading}
 								<button 
 									on:click={stopGeneration}
-									class="px-4 bg-red-500 hover:bg-red-600 text-white font-bold rounded-lg transition-all"
+									class="px-4 bg-red-500 hover:bg-red-600 text-white font-bold rounded-lg transition-all active:scale-95 flex items-center gap-2"
+									title="Stop generation (Esc)"
 								>
+									<X class="w-4 h-4" />
 									Stop
 								</button>
 							{:else}
 								<button 
 									on:click={sendMessage}
 									disabled={!$chatInput.trim()}
-									class="px-6 bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 disabled:from-slate-700 disabled:to-slate-700 disabled:cursor-not-allowed text-white font-bold rounded-lg transition-all shadow-lg shadow-amber-500/20"
+									class="px-6 bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 hover:to-orange-700 disabled:from-slate-700 disabled:to-slate-700 disabled:cursor-not-allowed text-white font-bold rounded-lg transition-all shadow-lg shadow-amber-500/20 active:scale-95 flex items-center gap-2"
+									title="Send message (Enter or Cmd+Enter)"
 								>
+									<Play class="w-4 h-4 fill-current" />
 									Send
 								</button>
 							{/if}
+						</div>
+						<!-- Keyboard hints -->
+						<div class="mt-2 text-[10px] text-slate-500 flex items-center gap-4">
+							<span>💡 <kbd class="px-1.5 py-0.5 bg-slate-800 rounded text-amber-400">Enter</kbd> to send</span>
+							<span><kbd class="px-1.5 py-0.5 bg-slate-800 rounded text-amber-400">Shift+Enter</kbd> for new line</span>
+							<span><kbd class="px-1.5 py-0.5 bg-slate-800 rounded text-amber-400">Esc</kbd> to stop</span>
 						</div>
 					</div>
 				</div>
@@ -2019,6 +2144,16 @@
 		}
 	}
 
+	/* Cursor blink animation for live file preview - Cursor-style */
+	@keyframes cursor-blink {
+		0%, 50% {
+			opacity: 1;
+		}
+		51%, 100% {
+			opacity: 0;
+		}
+	}
+
 	:global(.animate-fadeIn) {
 		animation: fadeIn 0.3s ease-out;
 	}
@@ -2029,5 +2164,9 @@
 
 	:global(.animate-pulse-subtle) {
 		animation: pulse-subtle 2s ease-in-out infinite;
+	}
+
+	:global(.animate-cursor-blink) {
+		animation: cursor-blink 1s step-end infinite;
 	}
 </style>
