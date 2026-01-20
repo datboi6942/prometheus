@@ -98,6 +98,11 @@ class ModelRouter:
             # Reasoning models tend to generate excessive thinking - cap it
             if max_tokens is None:
                 max_tokens = 4096  # Tight limit for faster decisions
+        else:
+            # For non-reasoning models, set a generous default to prevent truncation
+            # Agentic tasks often require outputting tool calls with file content
+            if max_tokens is None:
+                max_tokens = 16384  # High limit for agentic tasks with file writes
         
         if max_tokens:
             extra["max_tokens"] = max_tokens

@@ -58,6 +58,7 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
     logger = structlog.get_logger()
     
     tool_calls = []
+    truncation_detected = False
     
     # Strategy 1: Look for {"tool" pattern with regex
     patterns = [
@@ -106,6 +107,20 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
                                 logger.warning("JSON decode failed", error=str(e), json_preview=json_str[:100])
                             break
                 j += 1
+            
+            # Check if we reached the end without finding closing brace (truncated JSON)
+            if j >= len(text) and brace_count > 0:
+                truncation_detected = True
+                # Extract tool name from the truncated JSON for logging
+                tool_name_match = re.search(r'"tool"\s*:\s*"([^"]+)"', text[start:])
+                tool_name = tool_name_match.group(1) if tool_name_match else "unknown"
+                logger.warning(
+                    "TRUNCATED JSON DETECTED - model output was cut off",
+                    tool=tool_name,
+                    brace_depth=brace_count,
+                    text_length=len(text),
+                    hint="Model likely hit max_tokens limit. The output was truncated before the JSON could complete."
+                )
     
     # Strategy 2: Try to find JSON objects that look like tool calls using simple search
     if not tool_calls:
@@ -160,7 +175,16 @@ def extract_tool_calls(text: str) -> list[tuple[dict, int, int]]:
                                     break
                         j += 1
     
-    logger.info("Tool extraction complete", found=len(tool_calls), text_preview=text[:200] if text else "")
+    if truncation_detected and not tool_calls:
+        logger.error(
+            "Tool extraction failed due to truncation",
+            found=0,
+            truncated=True,
+            text_preview=text[:200] if text else "",
+            hint="Model output was truncated. Increase max_tokens or simplify the task."
+        )
+    else:
+        logger.info("Tool extraction complete", found=len(tool_calls), text_preview=text[:200] if text else "")
     
     return tool_calls
 
@@ -1112,6 +1136,46 @@ DO IT NOW. No more reading. No more explaining. Just the tool call."""
                         yield f"data: {compression_notification}\n\n"
 
                     # Continue loop to get model's next response
+                    continue
+                
+                # Check for truncated tool call JSON (model output was cut off)
+                # This happens when max_tokens is hit during a large file write
+                truncation_patterns = [
+                    r'\{"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^}]*$',  # Tool call started but never closed
+                    r'"content"\s*:\s*"[^"]*$',  # Content string never closed
+                ]
+                response_might_be_truncated = any(
+                    re.search(p, accumulated_response[-500:] if len(accumulated_response) > 500 else accumulated_response)
+                    for p in truncation_patterns
+                )
+                
+                if response_might_be_truncated and consecutive_lazy_kicks < max_lazy_kicks:
+                    consecutive_lazy_kicks += 1
+                    logger.warning(
+                        "Detected truncated tool call - model output was cut off",
+                        response_length=len(accumulated_response),
+                        consecutive=consecutive_lazy_kicks
+                    )
+                    
+                    truncation_message = """⚠️ YOUR OUTPUT WAS TRUNCATED!
+
+Your tool call JSON was cut off mid-stream (likely hit the output token limit).
+
+DO NOT try to write large files in a single tool call. Instead:
+
+1. For NEW FILES: Write in smaller chunks or use filesystem_insert multiple times
+2. For EDITS: Use filesystem_replace_lines to edit specific line ranges instead of rewriting entire files
+3. For TEST FILES: Create a minimal test first, then add more tests incrementally
+
+RETRY with a SMALLER output. Example:
+{"tool": "filesystem_write", "args": {"path": "test_file.py", "content": "# Basic test file\\nimport unittest\\n\\nclass TestBasic(unittest.TestCase):\\n    def test_example(self):\\n        self.assertTrue(True)\\n"}}
+
+Keep the content SHORT. Do NOT include the full file."""
+                    
+                    current_messages.append({
+                        "role": "user",
+                        "content": truncation_message
+                    })
                     continue
                 
                 # No tool calls found - check if model is truly done or just being lazy
