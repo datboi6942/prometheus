@@ -974,98 +974,20 @@ Then write a SMALL skeleton first and build incrementally."""
 
             return result_text, result, tool_name, args
 
-        # ===== REACT LOOP INTEGRATION =====
-        # Use ReAct executor if enabled, otherwise fall back to original loop
+        # ===== REACT INTELLIGENCE INTEGRATION =====
+        # Initialize ReAct services if enabled
+        react_executor = None
         if ENABLE_REACT_LOOP:
-            logger.info("Using ReAct execution loop")
-            try:
-                # Initialize ReAct services
-                self_corrector = SelfCorrectorService()
-                react_executor = ReActExecutor(
-                    tool_registry=registry,
-                    self_corrector=self_corrector,
-                    workspace_path=translated_workspace,
-                    max_iterations=max_iterations
-                )
+            logger.info("ReAct intelligence enabled")
+            self_corrector = SelfCorrectorService()
+            react_executor = ReActExecutor(
+                tool_registry=registry,
+                self_corrector=self_corrector,
+                workspace_path=translated_workspace,
+                max_iterations=max_iterations
+            )
 
-                # Execute using ReAct pattern
-                async for event in react_executor.execute(
-                    messages=current_messages,
-                    model_router=model_router,
-                    model=request.model,
-                    plan=execution_plan
-                ):
-                    # Convert ReAct events to frontend format
-                    if event.get("type") == "thought":
-                        thought_data = json.dumps({
-                            "type": "react_thought",
-                            "iteration": event.get("iteration"),
-                            "thought": event.get("thought"),
-                            "reasoning": event.get("reasoning"),
-                            "confidence": event.get("confidence")
-                        })
-                        yield f"data: {thought_data}\n\n"
-
-                    elif event.get("type") == "action":
-                        # Tool execution - use existing execute_and_yield_tool
-                        action_data = json.dumps({
-                            "type": "react_action",
-                            "iteration": event.get("iteration"),
-                            "tool": event.get("tool"),
-                            "args": event.get("args")
-                        })
-                        yield f"data: {action_data}\n\n"
-
-                    elif event.get("type") == "observation":
-                        obs_data = json.dumps({
-                            "type": "react_observation",
-                            "iteration": event.get("iteration"),
-                            "success": event.get("success"),
-                            "interpretation": event.get("interpretation")
-                        })
-                        yield f"data: {obs_data}\n\n"
-
-                    elif event.get("type") == "reflection":
-                        refl_data = json.dumps({
-                            "type": "react_reflection",
-                            "iteration": event.get("iteration"),
-                            "assessment": event.get("assessment"),
-                            "should_continue": event.get("should_continue")
-                        })
-                        yield f"data: {refl_data}\n\n"
-
-                    elif event.get("type") == "loop_detected":
-                        loop_data = json.dumps({
-                            "type": "loop_warning",
-                            "loop_type": event.get("loop_type"),
-                            "severity": event.get("severity"),
-                            "suggestion": event.get("suggestion"),
-                            "evidence": event.get("evidence")
-                        })
-                        yield f"data: {loop_data}\n\n"
-
-                    elif event.get("type") == "execution_summary":
-                        summary_data = json.dumps({
-                            "type": "task_complete",
-                            "iterations": event.get("iterations"),
-                            "success_rate": event.get("self_corrector_summary", {}).get("successful_actions", 0) / max(event.get("total_actions", 1), 1),
-                            "total_actions": event.get("total_actions")
-                        })
-                        yield f"data: {summary_data}\n\n"
-
-                logger.info("ReAct execution completed successfully")
-                return
-
-            except Exception as e:
-                logger.error("ReAct execution failed, falling back to original loop", error=str(e))
-                error_data = json.dumps({
-                    "type": "react_error",
-                    "error": f"ReAct loop failed: {str(e)}. Falling back to original loop."
-                })
-                yield f"data: {error_data}\n\n"
-                # Continue to original loop below
-
-        # ===== ORIGINAL LOOP (DEFAULT) =====
+        # ===== MAIN EXECUTION LOOP =====
         try:
             while iteration < max_iterations:
                 iteration += 1
