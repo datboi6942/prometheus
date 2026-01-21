@@ -12,6 +12,7 @@ This replaces the simple while loop with intelligent, self-correcting execution.
 from typing import Any, AsyncGenerator, Dict, List, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
+import asyncio
 import json
 import structlog
 
@@ -394,12 +395,23 @@ class ReActExecutor:
             Tool result dictionary
         """
         try:
-            result = await self.tool_registry.execute_tool(
-                name=action.tool,
-                args=action.args,
-                context={"workspace_path": self.workspace_path}
+            # Execute tool with timeout
+            result = await asyncio.wait_for(
+                self.tool_registry.execute_tool(
+                    name=action.tool,
+                    args=action.args,
+                    context={"workspace_path": self.workspace_path}
+                ),
+                timeout=60.0  # 60 second timeout per tool execution
             )
             return result
+        except asyncio.TimeoutError:
+            logger.error("Tool execution timed out", tool=action.tool, timeout=60)
+            return {
+                "success": False,
+                "error": f"Tool {action.tool} timed out after 60 seconds. The operation may be too complex or stuck. Try a simpler approach.",
+                "timeout": True
+            }
         except Exception as e:
             logger.error("Tool execution error", tool=action.tool, error=str(e))
             return {
