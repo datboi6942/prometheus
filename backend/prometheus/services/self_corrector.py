@@ -40,6 +40,7 @@ class ActionRecord(BaseModel):
     timestamp: str
     success: bool
     error: Optional[str] = None
+    execution_time: Optional[float] = None  # Time in seconds
 
 
 class ErrorPattern(BaseModel):
@@ -75,6 +76,92 @@ class SelfCorrectorService:
         self.read_loop_threshold = 5  # Max reads of same file before warning
         self.syntax_loop_threshold = 3  # Max syntax errors on same file
         self.tool_repetition_threshold = 4  # Max identical tool calls
+        
+        # Progressive intervention levels
+        self.progressive_intervention = True
+        self.intervention_levels = {
+            "warning": 2,      # Level 1: Warning nudges after 2 duplicate reads
+            "restriction": 3,  # Level 2: Tool restriction after 3 duplicate reads
+            "forced_edit": 5,  # Level 3: Forced edit requirement after 5 reads
+            "reset": 8         # Level 4: Task reset with preserved context
+        }
+        
+        # Syntax error recovery
+        self.syntax_auto_rollback_threshold = 2  # Auto-rollback after 2 syntax errors on same file
+        self.max_total_syntax_errors = 8  # Abort if too many syntax errors overall
+        
+        # Execution time tracking
+        self.slow_tool_threshold = 30.0  # 30 seconds threshold for slow tools
+        self.timeout_threshold = 120.0   # 2 minute timeout threshold
+        
+        # Session memory management
+        self.max_history_size = 50  # Keep last 50 actions in history
+        self.enable_sliding_window = True  # Enable automatic pruning
+
+    def _get_intervention_level(self, read_count: int) -> Optional[str]:
+        """Get intervention level based on read count.
+        
+        Args:
+            read_count: Number of times file has been read
+            
+        Returns:
+            Intervention level name or None if no intervention needed
+        """
+        if not self.progressive_intervention:
+            return None
+            
+        if read_count >= self.intervention_levels["reset"]:
+            return "reset"
+        elif read_count >= self.intervention_levels["forced_edit"]:
+            return "forced_edit"
+        elif read_count >= self.intervention_levels["restriction"]:
+            return "restriction"
+        elif read_count >= self.intervention_levels["warning"]:
+            return "warning"
+        return None
+
+    def _prune_history(self):
+        """Prune action history to keep only recent actions (sliding window)."""
+        if not self.enable_sliding_window or len(self.action_history) <= self.max_history_size:
+            return
+            
+        # Keep only the most recent actions
+        self.action_history = self.action_history[-self.max_history_size:]
+        
+        # Rebuild derived data structures from pruned history
+        self.file_read_counts.clear()
+        self.file_edit_counts.clear()
+        self.file_syntax_errors.clear()
+        self.tool_call_sequence.clear()
+        
+        # Re-populate from pruned history
+        for action in self.action_history:
+            # Track tool sequence
+            self.tool_call_sequence.append((action.tool, action.args))
+            
+            # Track file reads
+            if action.tool in ["filesystem_read", "read_file"]:
+                file_path = action.args.get("path", "")
+                if file_path:
+                    self.file_read_counts[file_path] += 1
+            
+            # Track file edits
+            if action.tool in ["filesystem_write", "filesystem_replace_lines", "filesystem_search_replace"]:
+                file_path = action.args.get("path", "")
+                if file_path:
+                    self.file_edit_counts[file_path] += 1
+            
+            # Track syntax errors
+            if not action.success and action.error and "syntax" in action.error.lower():
+                file_path = action.args.get("path", "")
+                if file_path:
+                    self.file_syntax_errors[file_path].append(action.error)
+        
+        logger.debug(
+            "History pruned",
+            remaining_actions=len(self.action_history),
+            max_history=self.max_history_size
+        )
 
     def record_action(
         self,
@@ -82,7 +169,8 @@ class SelfCorrectorService:
         tool: str,
         args: Dict[str, Any],
         success: bool,
-        error: Optional[str] = None
+        error: Optional[str] = None,
+        execution_time: Optional[float] = None
     ) -> None:
         """Record an action taken by the agent.
 
@@ -92,6 +180,7 @@ class SelfCorrectorService:
             args: Arguments passed to the tool
             success: Whether the tool call succeeded
             error: Error message if tool call failed
+            execution_time: Time taken to execute the tool in seconds
         """
         action = ActionRecord(
             iteration=iteration,
@@ -99,7 +188,8 @@ class SelfCorrectorService:
             args=args,
             timestamp=datetime.now(timezone.utc).isoformat(),
             success=success,
-            error=error
+            error=error,
+            execution_time=execution_time
         )
         self.action_history.append(action)
         self.tool_call_sequence.append((tool, args))
@@ -120,6 +210,9 @@ class SelfCorrectorService:
             file_path = args.get("path", "")
             if file_path:
                 self.file_syntax_errors[file_path].append(error)
+        
+        # Prune history if needed (sliding window)
+        self._prune_history()
 
         logger.debug(
             "Action recorded",
@@ -159,7 +252,7 @@ class SelfCorrectorService:
         return None
 
     def _detect_read_loop(self, window: int) -> Optional[LoopDetection]:
-        """Detect if agent keeps reading the same files."""
+        """Detect if agent keeps reading the same files with progressive intervention."""
         recent_actions = self.action_history[-window:]
         read_actions = [
             a for a in recent_actions
@@ -177,36 +270,96 @@ class SelfCorrectorService:
         if not file_counts:
             return None
 
-        most_read_file, read_count = file_counts.most_common(1)[0]
-
-        if read_count >= self.read_loop_threshold:
-            # Check if we're making any edits
-            recent_edits = [
-                a for a in recent_actions
-                if a.tool in ["filesystem_write", "filesystem_replace_lines", "filesystem_search_replace"]
-            ]
-
+        most_read_file, recent_read_count = file_counts.most_common(1)[0]
+        total_read_count = self.file_read_counts.get(most_read_file, 0)
+        
+        # Check if we're making any edits
+        recent_edits = [
+            a for a in recent_actions
+            if a.tool in ["filesystem_write", "filesystem_replace_lines", "filesystem_search_replace"]
+        ]
+        
+        # Determine intervention level
+        intervention_level = self._get_intervention_level(total_read_count)
+        
+        if intervention_level == "reset" or total_read_count >= self.intervention_levels["reset"]:
+            # Level 4: Task reset with preserved context
+            return LoopDetection(
+                loop_type=LoopType.READ_LOOP,
+                severity=10,
+                evidence=[
+                    f"Read '{most_read_file}' {total_read_count} times total ({recent_read_count} recent)",
+                    f"Only {len(recent_edits)} edit actions in last {window} actions",
+                    "Agent is completely stuck - task reset required"
+                ],
+                suggestion=(
+                    f"🛑 CRITICAL: You've read '{most_read_file}' {total_read_count} TIMES!\n"
+                    "This task is being RESET. All tool calls are BLOCKED.\n"
+                    "The system will preserve context and restart with a new strategy.\n"
+                    "Please wait for system intervention."
+                ),
+                should_stop=True
+            )
+        elif intervention_level == "forced_edit" or total_read_count >= self.intervention_levels["forced_edit"]:
+            # Level 3: Forced edit requirement
+            return LoopDetection(
+                loop_type=LoopType.READ_LOOP,
+                severity=9,
+                evidence=[
+                    f"Read '{most_read_file}' {total_read_count} times total ({recent_read_count} recent)",
+                    f"Only {len(recent_edits)} edit actions in same period",
+                    "Agent must edit now - further reads blocked"
+                ],
+                suggestion=(
+                    f"🚫 FORCED EDIT: You've read '{most_read_file}' {total_read_count} times.\n"
+                    "ALL READ OPERATIONS ARE NOW BLOCKED for this file.\n"
+                    "You MUST edit the file NOW using filesystem_replace_lines or filesystem_search_replace.\n"
+                    "Example:\n"
+                    f'{{"tool": "filesystem_replace_lines", "args": {{"path": "{most_read_file}", "start_line": 1, "end_line": 10, "replacement": "your fixed code here"}}}}'
+                ),
+                should_stop=False  # Agent can still act, but reads blocked
+            )
+        elif intervention_level == "restriction" or total_read_count >= self.intervention_levels["restriction"]:
+            # Level 2: Tool restriction
+            return LoopDetection(
+                loop_type=LoopType.READ_LOOP,
+                severity=8,
+                evidence=[
+                    f"Read '{most_read_file}' {total_read_count} times total ({recent_read_count} recent)",
+                    f"Only {len(recent_edits)} edit actions in same period",
+                    "Agent showing strong analysis paralysis"
+                ],
+                suggestion=(
+                    f"⚠️ TOOL RESTRICTION: You've read '{most_read_file}' {total_read_count} times.\n"
+                    "filesystem_read is now RESTRICTED for this file.\n"
+                    "You must use an edit tool immediately:\n"
+                    f'{{"tool": "filesystem_replace_lines", "args": {{"path": "{most_read_file}", "start_line": N, "end_line": M, "replacement": "fixed code"}}}}'
+                ),
+                should_stop=False
+            )
+        elif intervention_level == "warning" or total_read_count >= self.intervention_levels["warning"]:
+            # Level 1: Warning nudges
             if len(recent_edits) < 2:  # Very few edits compared to reads
                 return LoopDetection(
                     loop_type=LoopType.READ_LOOP,
-                    severity=8,
+                    severity=7,
                     evidence=[
-                        f"Read '{most_read_file}' {read_count} times in last {window} actions",
+                        f"Read '{most_read_file}' {total_read_count} times total ({recent_read_count} recent)",
                         f"Only {len(recent_edits)} edit actions in same period",
                         "Agent appears to be stuck analyzing instead of acting"
                     ],
                     suggestion=(
-                        f"STOP reading files. You've read '{most_read_file}' {read_count} times. "
-                        "You already have the information you need. START EDITING FILES NOW. "
+                        f"🔔 WARNING: You've read '{most_read_file}' {total_read_count} times.\n"
+                        "You already have the information you need. START EDITING FILES NOW.\n"
                         "Use filesystem_replace_lines or filesystem_search_replace to make changes."
                     ),
-                    should_stop=False  # Warning, but let agent try to recover
+                    should_stop=False
                 )
-
+        
         return None
 
     def _detect_syntax_loop(self) -> Optional[LoopDetection]:
-        """Detect repeated syntax errors on the same file."""
+        """Detect repeated syntax errors on the same file with auto-rollback."""
         if not self.file_syntax_errors:
             return None
 
@@ -216,13 +369,37 @@ class SelfCorrectorService:
             key=lambda x: len(x[1])
         )
         file_path, errors = worst_file
+        error_count = len(errors)
 
-        if len(errors) >= self.syntax_loop_threshold:
+        # Check total syntax errors across all files
+        total_errors = sum(len(errs) for errs in self.file_syntax_errors.values())
+        
+        if total_errors >= self.max_total_syntax_errors:
+            return LoopDetection(
+                loop_type=LoopType.SYNTAX_LOOP,
+                severity=10,
+                evidence=[
+                    f"{total_errors} total syntax errors across all files",
+                    f"Worst file: '{file_path}' with {error_count} errors",
+                    "Too many syntax errors - aborting task"
+                ],
+                suggestion=(
+                    "🛑 CRITICAL: Too many syntax errors overall.\n"
+                    "This task is being ABORTED. Please restart with a simpler approach.\n"
+                    "Consider:\n"
+                    "1. Starting with a smaller, working code snippet\n"
+                    "2. Using the incremental builder service\n"
+                    "3. Asking for user clarification on requirements"
+                ),
+                should_stop=True
+            )
+        
+        if error_count >= self.syntax_loop_threshold:
             return LoopDetection(
                 loop_type=LoopType.SYNTAX_LOOP,
                 severity=9,
                 evidence=[
-                    f"{len(errors)} syntax errors on '{file_path}'",
+                    f"{error_count} syntax errors on '{file_path}'",
                     f"Errors: {errors[:3]}",  # Show first 3 errors
                     "Repeated fixes are not working"
                 ],
@@ -235,6 +412,27 @@ class SelfCorrectorService:
                     "4. Ask the user for clarification on the requirements"
                 ),
                 should_stop=True  # Stop and force strategy change
+            )
+        
+        # Auto-rollback suggestion after 2 syntax errors
+        if error_count >= self.syntax_auto_rollback_threshold:
+            return LoopDetection(
+                loop_type=LoopType.SYNTAX_LOOP,
+                severity=8,
+                evidence=[
+                    f"{error_count} syntax errors on '{file_path}'",
+                    f"Recent error: {errors[-1][:100]}",
+                    "Consider rolling back to last working version"
+                ],
+                suggestion=(
+                    f"⚠️ SYNTAX ERROR PATTERN: {error_count} errors on '{file_path}'\n"
+                    "Consider using AUTO-ROLLBACK to last checkpoint:\n"
+                    "1. Restore file from last checkpoint before these edits\n"
+                    "2. Use incremental builder to add code piece by piece\n"
+                    "3. Validate syntax after each small addition\n"
+                    "4. Use read_diagnostics after every edit"
+                ),
+                should_stop=False  # Warning, but agent can continue
             )
 
         return None

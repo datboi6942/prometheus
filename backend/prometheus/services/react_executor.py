@@ -12,6 +12,7 @@ This replaces the simple while loop with intelligent, self-correcting execution.
 from typing import Any, AsyncGenerator, Dict, List, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
+import asyncio
 import json
 import structlog
 
@@ -120,7 +121,8 @@ class ReActExecutor:
         tool: str,
         args: Dict[str, Any],
         success: bool,
-        error: Optional[str] = None
+        error: Optional[str] = None,
+        execution_time: Optional[float] = None
     ):
         """Record a tool execution for self-correction.
 
@@ -132,13 +134,15 @@ class ReActExecutor:
             args: Tool arguments
             success: Whether execution succeeded
             error: Error message if failed
+            execution_time: Time taken to execute tool in seconds (optional)
         """
         self.self_corrector.record_action(
             iteration=iteration,
             tool=tool,
             args=args,
             success=success,
-            error=error
+            error=error,
+            execution_time=execution_time
         )
 
     def get_reflection(self, iteration: int) -> ReflectionRecord:

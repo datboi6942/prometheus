@@ -109,7 +109,14 @@ class IncrementalBuilderService:
             }
 
         # Step 2: Order sections by dependencies
-        ordered_sections = self._order_by_dependencies(sections)
+        try:
+            ordered_sections = self._order_by_dependencies(sections)
+        except ValueError as e:
+            logger.error("Circular dependency detected", error=str(e))
+            return {
+                "success": False,
+                "error": f"Circular dependency in sections: {str(e)}"
+            }
 
         # Step 3: Add sections incrementally
         build_steps = []
@@ -287,25 +294,32 @@ class IncrementalBuilderService:
         ordered = []
         added = set()
 
-        def add_section(section_id: str):
+        def add_section(section_id: str, visiting: set):
             if section_id in added:
                 return
+            
+            if section_id in visiting:
+                raise ValueError(f"Circular dependency detected involving section '{section_id}'")
 
             section = section_map.get(section_id)
             if not section:
                 return
 
+            visiting.add(section_id)
+            
             # Add dependencies first
             for dep_id in section.dependencies:
-                add_section(dep_id)
-
+                add_section(dep_id, visiting)
+            
+            visiting.remove(section_id)
+            
             # Then add this section
             ordered.append(section)
             added.add(section_id)
 
         # Add all sections (respecting dependencies)
         for section in sections:
-            add_section(section.section_id)
+            add_section(section.section_id, set())
 
         return ordered
 

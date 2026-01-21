@@ -322,12 +322,11 @@ class VerificationLoopService:
                 process.kill()
                 await process.wait()
                 logger.error("Test execution timed out", test_files=test_files)
-                return VerificationCheck(
-                    check_type="tests",
+                return VerificationResult(
+                    type=VerificationType.UNIT_TESTS,
                     passed=False,
-                    blocking=False,  # Non-blocking to allow user to decide
-                    errors=["Test execution timed out after 5 minutes"],
-                    message="Tests took too long to execute (timeout: 5 minutes)"
+                    blocking=False,
+                    errors=["Test execution timed out after 5 minutes"]
                 )
 
             passed = process.returncode == 0

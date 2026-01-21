@@ -1,4 +1,5 @@
 import json
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -31,6 +32,7 @@ from prometheus.services.code_validator import CodeValidatorService, ValidationS
 from prometheus.services.verification_loop import VerificationLoopService
 from prometheus.services.incremental_builder import IncrementalBuilderService, CodeSection, SectionType
 from prometheus.services.smart_editor import SmartEditorService
+from prometheus.services.checkpoint_service import CheckpointService
 
 router = APIRouter(prefix="/api/v1")
 logger = structlog.get_logger()
@@ -749,6 +751,10 @@ NEVER output a single file with 300+ lines - it will timeout and fail!""".format
         # Cross-iteration deduplication for edits (prevent same edit being made multiple times)
         completed_edits = set()  # Track (path, start_line, end_line, content_hash) tuples
         
+        # Incremental checkpointing - track successful tool executions and modified files
+        successful_tool_count = 0
+        modified_files = set()  # Files that have been edited in this session
+        
         # Track stream retries to prevent infinite retry loops
         empty_stream_retries = 0
         max_empty_stream_retries = 3  # Max consecutive empty streams before giving up
@@ -769,17 +775,23 @@ NEVER output a single file with 300+ lines - it will timeout and fail!""".format
         incremental_builder = None
         smart_editor = None
 
-        if ENABLE_CODE_VALIDATION:
-            logger.info("Code validation enabled")
+        # Translate workspace path for Phase 2 services
+        translated_workspace = translate_host_path_to_container(
+            request.workspace_path or settings.workspace_path
+        )
+
+        # Create code validator if any code quality service is enabled
+        if ENABLE_CODE_VALIDATION or ENABLE_VERIFICATION_LOOP or ENABLE_INCREMENTAL_BUILDER:
+            logger.info("Code validator created for code quality services")
             code_validator = CodeValidatorService(workspace_path=translated_workspace)
 
         if ENABLE_VERIFICATION_LOOP:
             logger.info("Verification loop enabled")
-            verification_loop = VerificationLoopService(workspace_path=translated_workspace)
+            verification_loop = VerificationLoopService(code_validator=code_validator, workspace_path=translated_workspace)
 
         if ENABLE_INCREMENTAL_BUILDER:
             logger.info("Incremental builder enabled")
-            incremental_builder = IncrementalBuilderService(workspace_path=translated_workspace)
+            incremental_builder = IncrementalBuilderService(code_validator=code_validator, workspace_path=translated_workspace)
 
         if ENABLE_SMART_EDITOR:
             logger.info("Smart editor enabled")
@@ -788,7 +800,7 @@ NEVER output a single file with 300+ lines - it will timeout and fail!""".format
         # Helper to execute a single tool and yield results
         async def execute_and_yield_tool(tool_call: dict) -> tuple[str, dict, str, dict]:
             """Execute a tool call and yield results to frontend. Returns (result_text, result_dict)."""
-            nonlocal completed_edits, read_only_operations, edit_operations, files_read, file_read_attempts, total_blocked_reads, consecutive_blocked_reads
+            nonlocal completed_edits, read_only_operations, edit_operations, files_read, file_read_attempts, total_blocked_reads, consecutive_blocked_reads, successful_tool_count, modified_files
             nonlocal syntax_error_counts, total_syntax_errors, last_syntax_error_file, consecutive_syntax_errors
             
             tool_name = tool_call.get("tool")
@@ -923,11 +935,23 @@ Example:
             translated_workspace = translate_host_path_to_container(
                 request.workspace_path or settings.workspace_path
             )
-            result = await registry.execute_tool(
-                name=tool_name,
-                args=args,
-                context={"workspace_path": translated_workspace, "mcp_tools": mcp_tools},
-            )
+            # Execute tool with timeout
+            try:
+                result = await asyncio.wait_for(
+                    registry.execute_tool(
+                        name=tool_name,
+                        args=args,
+                        context={"workspace_path": translated_workspace, "mcp_tools": mcp_tools},
+                    ),
+                    timeout=60.0  # 60 second timeout per tool execution
+                )
+            except asyncio.TimeoutError:
+                logger.error("Tool execution timed out", tool=tool_name, timeout=60)
+                result = {
+                    "success": False,
+                    "error": f"Tool {tool_name} timed out after 60 seconds. The operation may be too complex or stuck. Try a simpler approach.",
+                    "timeout": True
+                }
 
             logger.info("Tool execution result", tool=tool_name, success=result.get("success", False))
 
@@ -935,6 +959,35 @@ Example:
             if result.get("success") and not result.get("blocked"):
                 consecutive_blocked_reads = 0
                 consecutive_syntax_errors = 0  # Also reset syntax error streak
+                
+                # Increment successful tool count and track modified files
+                successful_tool_count += 1
+                edit_tools = {'filesystem_write', 'filesystem_replace_lines', 'filesystem_insert', 'filesystem_search_replace'}
+                if tool_name in edit_tools:
+                    file_path = args.get("path", "")
+                    if file_path:
+                        modified_files.add(file_path)
+                
+                # Create incremental checkpoint every 10 successful tool executions
+                if successful_tool_count % 10 == 0 and modified_files:
+                    try:
+                        checkpoint_service = CheckpointService()
+                        checkpoint_id = await checkpoint_service.create_checkpoint(
+                            workspace_path=translated_workspace,
+                            file_paths=list(modified_files),
+                            description=f"Incremental checkpoint after {successful_tool_count} successful tools",
+                            conversation_id=None,  # TODO: Get conversation ID if available
+                            auto_prune=True,
+                            keep_last=5
+                        )
+                        logger.info("Created incremental checkpoint",
+                                    checkpoint_id=checkpoint_id, 
+                                    successful_tools=successful_tool_count,
+                                    files=len(modified_files))
+                        # Clear modified files for next incremental checkpoint
+                        modified_files.clear()
+                    except Exception as e:
+                        logger.error("Failed to create incremental checkpoint", error=str(e))
 
             # ===== POST-EXECUTION VERIFICATION (Phase 2) =====
             # Verify changes after successful edit
