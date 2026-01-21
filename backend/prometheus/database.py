@@ -263,6 +263,54 @@ async def init_db() -> None:
             )
         """)
 
+        # Task executions table (for ReAct intelligence tracking)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS task_executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT,
+                task_description TEXT NOT NULL,
+                complexity TEXT NOT NULL,
+                plan_id TEXT,
+                success INTEGER DEFAULT 0,
+                iterations_taken INTEGER DEFAULT 0,
+                errors_encountered INTEGER DEFAULT 0,
+                files_modified INTEGER DEFAULT 0,
+                execution_summary TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+            )
+        """)
+
+        # Error patterns table (for self-correction learning)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS error_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                error_type TEXT NOT NULL,
+                file_path TEXT,
+                error_message TEXT NOT NULL,
+                suggested_fix TEXT,
+                times_occurred INTEGER DEFAULT 1,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL
+            )
+        """)
+
+        # Plan executions table (for tracking step completion)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS plan_executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id TEXT NOT NULL,
+                task_execution_id INTEGER,
+                step_number INTEGER NOT NULL,
+                step_description TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                FOREIGN KEY (task_execution_id) REFERENCES task_executions(id)
+            )
+        """)
+
         # Create index for faster memory searches
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_workspace ON memories(workspace_path)
@@ -281,6 +329,15 @@ async def init_db() -> None:
         """)
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_codebase_embeddings_file ON codebase_embeddings(file_path)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_executions_conversation ON task_executions(conversation_id)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_error_patterns_file ON error_patterns(file_path)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_plan_executions_task ON plan_executions(task_execution_id)
         """)
 
         await db.commit()
