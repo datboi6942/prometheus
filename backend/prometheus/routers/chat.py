@@ -20,11 +20,17 @@ from prometheus.routers.health import get_model_router
 from prometheus.services.model_router import ModelRouter
 from prometheus.services.context_manager import check_and_compress_if_needed, is_reasoning_model
 
-# ReAct intelligence services
+# ReAct intelligence services (Phase 1)
 from prometheus.services.task_planner import TaskPlannerService, TaskComplexity
 from prometheus.services.self_corrector import SelfCorrectorService
 from prometheus.services.prompt_builder import PromptBuilder, TaskType
 from prometheus.services.react_executor import ReActExecutor
+
+# Code quality services (Phase 2)
+from prometheus.services.code_validator import CodeValidatorService, ValidationStage
+from prometheus.services.verification_loop import VerificationLoopService
+from prometheus.services.incremental_builder import IncrementalBuilderService, CodeSection, SectionType
+from prometheus.services.smart_editor import SmartEditorService
 
 router = APIRouter(prefix="/api/v1")
 logger = structlog.get_logger()
@@ -639,10 +645,16 @@ NEVER output a single file with 300+ lines - it will timeout and fail!""".format
         context=context_keywords,
     )
     
-    # Feature flag for ReAct loop (gradual rollout)
+    # Feature flags for Phase 1 (ReAct intelligence)
     ENABLE_REACT_LOOP = os.getenv("ENABLE_REACT_LOOP", "false").lower() == "true"
     ENABLE_PROMPT_BUILDER = os.getenv("ENABLE_PROMPT_BUILDER", "false").lower() == "true"
     ENABLE_TASK_PLANNING = os.getenv("ENABLE_TASK_PLANNING", "false").lower() == "true"
+
+    # Feature flags for Phase 2 (Code quality)
+    ENABLE_CODE_VALIDATION = os.getenv("ENABLE_CODE_VALIDATION", "false").lower() == "true"
+    ENABLE_VERIFICATION_LOOP = os.getenv("ENABLE_VERIFICATION_LOOP", "false").lower() == "true"
+    ENABLE_INCREMENTAL_BUILDER = os.getenv("ENABLE_INCREMENTAL_BUILDER", "false").lower() == "true"
+    ENABLE_SMART_EDITOR = os.getenv("ENABLE_SMART_EDITOR", "false").lower() == "true"
 
     # Build system prompt (with PromptBuilder if enabled)
     if ENABLE_PROMPT_BUILDER:
@@ -750,6 +762,29 @@ NEVER output a single file with 300+ lines - it will timeout and fail!""".format
         last_syntax_error_file: str | None = None  # Track last file with syntax error
         consecutive_syntax_errors = 0  # Track consecutive syntax errors (reset on success)
 
+        # ===== PHASE 2 CODE QUALITY SERVICES INITIALIZATION =====
+        # Initialize Phase 2 services if enabled
+        code_validator = None
+        verification_loop = None
+        incremental_builder = None
+        smart_editor = None
+
+        if ENABLE_CODE_VALIDATION:
+            logger.info("Code validation enabled")
+            code_validator = CodeValidatorService(workspace_path=translated_workspace)
+
+        if ENABLE_VERIFICATION_LOOP:
+            logger.info("Verification loop enabled")
+            verification_loop = VerificationLoopService(workspace_path=translated_workspace)
+
+        if ENABLE_INCREMENTAL_BUILDER:
+            logger.info("Incremental builder enabled")
+            incremental_builder = IncrementalBuilderService(workspace_path=translated_workspace)
+
+        if ENABLE_SMART_EDITOR:
+            logger.info("Smart editor enabled")
+            smart_editor = SmartEditorService(workspace_path=translated_workspace)
+
         # Helper to execute a single tool and yield results
         async def execute_and_yield_tool(tool_call: dict) -> tuple[str, dict, str, dict]:
             """Execute a tool call and yield results to frontend. Returns (result_text, result_dict)."""
@@ -854,6 +889,34 @@ Example:
                 # Add to completed edits BEFORE executing (to prevent race conditions)
                 completed_edits.add(edit_signature)
 
+            # ===== PRE-EXECUTION VALIDATION (Phase 2) =====
+            # Validate code before writing (Python files only)
+            if code_validator and tool_name == "filesystem_write":
+                file_path = args.get("path", "")
+                content = args.get("content", "")
+
+                if file_path.endswith(".py") and content:
+                    logger.info("Validating Python code before write", path=file_path)
+                    try:
+                        validation_results = await code_validator.validate_python(
+                            content=content,
+                            file_path=file_path,
+                            stages=[ValidationStage.SYNTAX, ValidationStage.FORMATTING]
+                        )
+
+                        # Check for blocking errors
+                        blocking_errors = [r for r in validation_results if not r.passed and r.level == "error"]
+                        if blocking_errors:
+                            # Auto-fix if available
+                            fixed_result = next((r for r in validation_results if r.auto_fixed_content), None)
+                            if fixed_result:
+                                logger.info("Auto-fixed validation errors", path=file_path)
+                                args["content"] = fixed_result.auto_fixed_content
+                            else:
+                                logger.warning("Validation failed", path=file_path, errors=len(blocking_errors))
+                    except Exception as e:
+                        logger.error("Validation failed", path=file_path, error=str(e))
+
             # Execute tool
             from prometheus.services.tool_registry import get_registry
             registry = get_registry()
@@ -867,12 +930,52 @@ Example:
             )
 
             logger.info("Tool execution result", tool=tool_name, success=result.get("success", False))
-            
+
             # Reset consecutive blocked reads on successful tool execution (agent made progress)
             if result.get("success") and not result.get("blocked"):
                 consecutive_blocked_reads = 0
                 consecutive_syntax_errors = 0  # Also reset syntax error streak
-            
+
+            # ===== POST-EXECUTION VERIFICATION (Phase 2) =====
+            # Verify changes after successful edit
+            edit_tools = {'filesystem_write', 'filesystem_replace_lines', 'filesystem_insert',
+                          'filesystem_search_replace'}
+            if verification_loop and result.get("success") and tool_name in edit_tools:
+                file_path = args.get("path", "")
+                if file_path and file_path.endswith(".py"):
+                    logger.info("Verifying changes", path=file_path)
+                    try:
+                        verification_results = await verification_loop.verify_changes([file_path])
+
+                        # Check for blocking issues
+                        blocking_issues = []
+                        warnings = []
+                        for verify_result in verification_results:
+                            for check in verify_result.checks:
+                                if not check.passed and check.blocking:
+                                    blocking_issues.append(check)
+                                elif not check.passed:
+                                    warnings.append(check)
+
+                        # Add verification feedback to result
+                        if blocking_issues:
+                            result["verification_failed"] = True
+                            result["verification_issues"] = [
+                                f"{check.check_type}: {check.message}" for check in blocking_issues
+                            ]
+                            logger.warning("Verification blocking issues found",
+                                         path=file_path, issues=len(blocking_issues))
+
+                        if warnings:
+                            result["verification_warnings"] = [
+                                f"{check.check_type}: {check.message}" for check in warnings
+                            ]
+                            logger.info("Verification warnings found",
+                                      path=file_path, warnings=len(warnings))
+
+                    except Exception as e:
+                        logger.error("Verification failed", path=file_path, error=str(e))
+
             # CRITICAL: Track syntax errors to detect infinite fix loops
             if result.get("syntax_error"):
                 file_path = args.get("path", "unknown")

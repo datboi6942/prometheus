@@ -398,6 +398,13 @@ class CodeValidatorService:
             full_path = self.workspace_path / file_path
             temp_file = full_path.with_suffix('.tmp.py')
 
+            # Clean up any existing temp file first
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception as e:
+                    logger.warning("Failed to clean up existing temp file", path=temp_file, error=str(e))
+
             try:
                 temp_file.write_text(content)
 

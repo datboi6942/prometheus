@@ -235,6 +235,11 @@ class SmartEditorService:
                 checkpoint_id=checkpoint_id
             )
 
+            # Automatically clean up old checkpoints to prevent memory growth
+            # Keep last 10 checkpoints per file
+            if len(self.checkpoints) > 20:  # Only clean if we have many checkpoints
+                self.clear_old_checkpoints(keep_last=10)
+
             return {
                 "success": True,
                 "file_path": file_path,

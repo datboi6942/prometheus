@@ -298,7 +298,7 @@ class VerificationLoopService:
             )
 
         try:
-            # Run pytest
+            # Run pytest with timeout
             process = await asyncio.create_subprocess_exec(
                 "pytest",
                 "-v",
@@ -310,8 +310,25 @@ class VerificationLoopService:
                 cwd=str(self.workspace_path)
             )
 
-            stdout, stderr = await process.communicate()
-            output = stdout.decode()
+            # Wait for tests with timeout (5 minutes)
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=300.0  # 5 minute timeout
+                )
+                output = stdout.decode()
+            except asyncio.TimeoutError:
+                # Kill the process if it times out
+                process.kill()
+                await process.wait()
+                logger.error("Test execution timed out", test_files=test_files)
+                return VerificationCheck(
+                    check_type="tests",
+                    passed=False,
+                    blocking=False,  # Non-blocking to allow user to decide
+                    errors=["Test execution timed out after 5 minutes"],
+                    message="Tests took too long to execute (timeout: 5 minutes)"
+                )
 
             passed = process.returncode == 0
 

@@ -239,8 +239,39 @@ class IncrementalBuilderService:
 
             return "\n".join(lines)
 
-        # Default skeleton for unknown languages
-        return f"# Skeleton for {language} file\n\n"
+        elif language in ["javascript", "typescript"]:
+            # Basic skeleton for JS/TS files
+            lines = ['// Module skeleton', '']
+
+            # Add import placeholders
+            import_sections = [s for s in sections if s.section_type == SectionType.IMPORTS]
+            if import_sections:
+                lines.append("// Imports will be added here")
+                lines.append("")
+
+            # Add section placeholders
+            for section in sections:
+                if section.section_type != SectionType.IMPORTS:
+                    desc = section.description or section.section_id
+                    lines.append(f"// TODO: Add {desc}")
+
+            lines.append("")
+
+            return "\n".join(lines)
+
+        elif language in ["java", "go", "rust", "c", "cpp"]:
+            # Placeholder for future language support
+            raise NotImplementedError(
+                f"Incremental building for {language} is not yet implemented. "
+                f"This language requires proper package/module structure that hasn't been added yet."
+            )
+
+        else:
+            # Unknown language - fail explicitly rather than creating invalid skeleton
+            raise NotImplementedError(
+                f"Language '{language}' is not supported by incremental builder. "
+                f"Supported languages: python, javascript, typescript"
+            )
 
     def _order_by_dependencies(self, sections: List[CodeSection]) -> List[CodeSection]:
         """Order sections by dependencies.
