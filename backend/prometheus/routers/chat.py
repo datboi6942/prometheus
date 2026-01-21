@@ -1,5 +1,7 @@
 import json
+import os
 import re
+from pathlib import Path
 from typing import Annotated
 
 import structlog
@@ -17,6 +19,12 @@ from prometheus.mcp.tools import MCPTools
 from prometheus.routers.health import get_model_router
 from prometheus.services.model_router import ModelRouter
 from prometheus.services.context_manager import check_and_compress_if_needed, is_reasoning_model
+
+# ReAct intelligence services
+from prometheus.services.task_planner import TaskPlannerService, TaskComplexity
+from prometheus.services.self_corrector import SelfCorrectorService
+from prometheus.services.prompt_builder import PromptBuilder, TaskType
+from prometheus.services.react_executor import ReActExecutor
 
 router = APIRouter(prefix="/api/v1")
 logger = structlog.get_logger()
@@ -106,17 +114,98 @@ def extract_tool_calls(text: str, log_results: bool = False) -> list[tuple[dict,
                                     already_found = any(tc[1] == start for tc in tool_calls)
                                     if not already_found:
                                         tool_calls.append((tool_call, start, j+1))
-                            except json.JSONDecodeError:
-                                pass  # Silent - will retry on next check
+                            except json.JSONDecodeError as e:
+                                # JSON parsing failed - try to repair it
+                                # This commonly happens when models generate unescaped content
+                                tool_name_match = re.search(r'"tool"\s*:\s*"([^"]+)"', json_str)
+                                tool_name = tool_name_match.group(1) if tool_name_match else None
+                                
+                                if tool_name:
+                                    # Try to manually extract the tool call
+                                    write_tools = {'filesystem_write', 'filesystem_replace_lines', 
+                                                   'filesystem_insert', 'filesystem_search_replace'}
+                                    
+                                    if tool_name in write_tools:
+                                        # Extract path
+                                        path_match = re.search(r'"path"\s*:\s*"([^"]+)"', json_str)
+                                        path = path_match.group(1) if path_match else None
+                                        
+                                        if path:
+                                            # Extract content using the same logic as truncation repair
+                                            content_key = "content" if tool_name == "filesystem_write" else "replacement"
+                                            content_pattern = rf'"{content_key}"\s*:\s*"'
+                                            content_match = re.search(content_pattern, json_str)
+                                            
+                                            if content_match:
+                                                content_start = content_match.end()
+                                                content = ""
+                                                i = content_start
+                                                while i < len(json_str) - 2:  # -2 to leave room for closing braces
+                                                    char = json_str[i]
+                                                    if char == '\\' and i + 1 < len(json_str):
+                                                        next_char = json_str[i + 1]
+                                                        if next_char == 'n':
+                                                            content += '\n'
+                                                        elif next_char == 't':
+                                                            content += '\t'
+                                                        elif next_char == 'r':
+                                                            content += '\r'
+                                                        elif next_char == '"':
+                                                            content += '"'
+                                                        elif next_char == '\\':
+                                                            content += '\\'
+                                                        else:
+                                                            content += char + next_char
+                                                        i += 2
+                                                    elif char == '"':
+                                                        # End of string (unescaped quote)
+                                                        break
+                                                    else:
+                                                        content += char
+                                                        i += 1
+                                                
+                                                if content:
+                                                    # Build repaired tool call
+                                                    if tool_name == "filesystem_write":
+                                                        repaired_tool = {"tool": tool_name, "args": {"path": path, "content": content}}
+                                                    elif tool_name == "filesystem_replace_lines":
+                                                        start_line_match = re.search(r'"start_line"\s*:\s*(\d+)', json_str)
+                                                        end_line_match = re.search(r'"end_line"\s*:\s*(\d+)', json_str)
+                                                        start_line = int(start_line_match.group(1)) if start_line_match else 1
+                                                        end_line = int(end_line_match.group(1)) if end_line_match else 9999
+                                                        repaired_tool = {"tool": tool_name, "args": {"path": path, "start_line": start_line, "end_line": end_line, "replacement": content}}
+                                                    else:
+                                                        repaired_tool = {"tool": tool_name, "args": {"path": path, content_key: content}}
+                                                    
+                                                    logger.info(
+                                                        "REPAIRED malformed JSON tool call",
+                                                        tool=tool_name,
+                                                        path=path,
+                                                        content_length=len(content),
+                                                        original_error=str(e)
+                                                    )
+                                                    already_found = any(tc[1] == start for tc in tool_calls)
+                                                    if not already_found:
+                                                        tool_calls.append((repaired_tool, start, j+1))
+                                    else:
+                                        # For non-write tools, log the error for debugging
+                                        if log_results:
+                                            logger.warning(
+                                                "JSON parse failed for tool call",
+                                                tool=tool_name,
+                                                error=str(e),
+                                                json_start=json_str[:100] if len(json_str) > 100 else json_str
+                                            )
                             break
                 j += 1
             
             # Check if we reached the end without finding closing brace (truncated JSON)
             if j >= len(text) and brace_count > 0:
                 truncation_detected = True
+                tool_name_match = re.search(r'"tool"\s*:\s*"([^"]+)"', text[start:])
+                tool_name = tool_name_match.group(1) if tool_name_match else "unknown"
+                
                 if log_results:
-                    tool_name_match = re.search(r'"tool"\s*:\s*"([^"]+)"', text[start:])
-                    tool_name = tool_name_match.group(1) if tool_name_match else "unknown"
                     logger.warning(
                         "TRUNCATED JSON DETECTED - model output was cut off",
                         tool=tool_name,
@@ -124,6 +213,78 @@ def extract_tool_calls(text: str, log_results: bool = False) -> list[tuple[dict,
                         text_length=len(text),
                         hint="Model likely hit max_tokens limit."
                     )
+                
+                # CRITICAL FIX: Try to repair truncated file write tool calls
+                # These are the most common to get truncated due to large content
+                write_tools = {'filesystem_write', 'filesystem_replace_lines', 'filesystem_insert', 'filesystem_search_replace'}
+                if tool_name in write_tools:
+                    truncated_json = text[start:]
+                    try:
+                        # Extract path - look for "path": "..." pattern
+                        path_match = re.search(r'"path"\s*:\s*"([^"]+)"', truncated_json)
+                        path = path_match.group(1) if path_match else None
+                        
+                        if path:
+                            # Extract content - this is the tricky part
+                            # For filesystem_write, look for "content": "..."
+                            # For filesystem_replace_lines, look for "replacement": "..."
+                            content_key = "content" if tool_name == "filesystem_write" else "replacement"
+                            content_pattern = rf'"{content_key}"\s*:\s*"'
+                            content_match = re.search(content_pattern, truncated_json)
+                            
+                            if content_match:
+                                content_start = content_match.end()
+                                # Find all content until the end, handling escape sequences
+                                content = ""
+                                i = content_start
+                                while i < len(truncated_json):
+                                    char = truncated_json[i]
+                                    if char == '\\' and i + 1 < len(truncated_json):
+                                        # Handle escape sequences
+                                        next_char = truncated_json[i + 1]
+                                        if next_char == 'n':
+                                            content += '\n'
+                                        elif next_char == 't':
+                                            content += '\t'
+                                        elif next_char == '"':
+                                            content += '"'
+                                        elif next_char == '\\':
+                                            content += '\\'
+                                        else:
+                                            content += char + next_char
+                                        i += 2
+                                    elif char == '"':
+                                        # End of string (unescaped quote)
+                                        break
+                                    else:
+                                        content += char
+                                        i += 1
+                                
+                                if content and path:
+                                    # Build repaired tool call
+                                    if tool_name == "filesystem_write":
+                                        repaired_tool = {"tool": tool_name, "args": {"path": path, "content": content}}
+                                    elif tool_name == "filesystem_replace_lines":
+                                        # Extract start_line and end_line
+                                        start_line_match = re.search(r'"start_line"\s*:\s*(\d+)', truncated_json)
+                                        end_line_match = re.search(r'"end_line"\s*:\s*(\d+)', truncated_json)
+                                        start_line = int(start_line_match.group(1)) if start_line_match else 1
+                                        end_line = int(end_line_match.group(1)) if end_line_match else 9999
+                                        repaired_tool = {"tool": tool_name, "args": {"path": path, "start_line": start_line, "end_line": end_line, "replacement": content}}
+                                    else:
+                                        repaired_tool = {"tool": tool_name, "args": {"path": path, content_key: content}}
+                                    
+                                    if log_results:
+                                        logger.info(
+                                            "REPAIRED truncated tool call",
+                                            tool=tool_name,
+                                            path=path,
+                                            content_length=len(content)
+                                        )
+                                    tool_calls.append((repaired_tool, start, len(text)))
+                    except Exception as e:
+                        if log_results:
+                            logger.error("Failed to repair truncated tool call", tool=tool_name, error=str(e))
     
     # Strategy 2: Try to find JSON objects that look like tool calls using simple search
     if not tool_calls:
@@ -169,8 +330,58 @@ def extract_tool_calls(text: str, log_results: bool = False) -> list[tuple[dict,
                                             already_found = any(tc[1] == brace_start for tc in tool_calls)
                                             if not already_found:
                                                 tool_calls.append((tool_call, brace_start, j+1))
-                                    except json.JSONDecodeError:
-                                        pass
+                                    except json.JSONDecodeError as e:
+                                        # Same repair logic for Strategy 2
+                                        write_tools = {'filesystem_write', 'filesystem_replace_lines', 
+                                                       'filesystem_insert', 'filesystem_search_replace'}
+                                        if tool_name in write_tools:
+                                            path_match = re.search(r'"path"\s*:\s*"([^"]+)"', json_str)
+                                            path = path_match.group(1) if path_match else None
+                                            if path:
+                                                content_key = "content" if tool_name == "filesystem_write" else "replacement"
+                                                content_pattern = rf'"{content_key}"\s*:\s*"'
+                                                content_match = re.search(content_pattern, json_str)
+                                                if content_match:
+                                                    content_start = content_match.end()
+                                                    content = ""
+                                                    i = content_start
+                                                    while i < len(json_str) - 2:
+                                                        char = json_str[i]
+                                                        if char == '\\' and i + 1 < len(json_str):
+                                                            next_char = json_str[i + 1]
+                                                            if next_char == 'n':
+                                                                content += '\n'
+                                                            elif next_char == 't':
+                                                                content += '\t'
+                                                            elif next_char == 'r':
+                                                                content += '\r'
+                                                            elif next_char == '"':
+                                                                content += '"'
+                                                            elif next_char == '\\':
+                                                                content += '\\'
+                                                            else:
+                                                                content += char + next_char
+                                                            i += 2
+                                                        elif char == '"':
+                                                            break
+                                                        else:
+                                                            content += char
+                                                            i += 1
+                                                    if content:
+                                                        if tool_name == "filesystem_write":
+                                                            repaired_tool = {"tool": tool_name, "args": {"path": path, "content": content}}
+                                                        elif tool_name == "filesystem_replace_lines":
+                                                            start_line_match = re.search(r'"start_line"\s*:\s*(\d+)', json_str)
+                                                            end_line_match = re.search(r'"end_line"\s*:\s*(\d+)', json_str)
+                                                            start_line = int(start_line_match.group(1)) if start_line_match else 1
+                                                            end_line = int(end_line_match.group(1)) if end_line_match else 9999
+                                                            repaired_tool = {"tool": tool_name, "args": {"path": path, "start_line": start_line, "end_line": end_line, "replacement": content}}
+                                                        else:
+                                                            repaired_tool = {"tool": tool_name, "args": {"path": path, content_key: content}}
+                                                        logger.info("REPAIRED malformed JSON (Strategy 2)", tool=tool_name, path=path, content_length=len(content))
+                                                        already_found = any(tc[1] == brace_start for tc in tool_calls)
+                                                        if not already_found:
+                                                            tool_calls.append((repaired_tool, brace_start, j+1))
                                     break
                         j += 1
     
@@ -369,12 +580,53 @@ CRITICAL RULES:
 5. After reading 1-2 files, START EDITING. Don't over-analyze.
 6. Complete the task fully before summarizing
 
+⚠️ FILE CREATION BEST PRACTICES (PREVENT SYNTAX ERRORS!):
+
+📝 PYTHON FILES - CRITICAL RULES:
+1. ALWAYS use 4 spaces for indentation (NEVER tabs)
+2. ALWAYS close all brackets (), [], {{}}, quotes "", and docstrings \"\"\" 
+3. ALWAYS end function/class definitions with a colon :
+4. When creating test files, keep them SHORT (under 100 lines per file)
+5. If a syntax error occurs, you will get a detailed error with line numbers - FIX IT, don't re-read the file
+
+🔧 CHUNKED FILE CREATION (for files > 100 lines):
+Instead of writing one massive file, build incrementally:
+
+Step 1 - Create skeleton:
+{{"tool": "filesystem_write", "args": {{"path": "myfile.py", "content": "#!/usr/bin/env python3\\n\\\"\\\"\\\"Module docstring\\\"\\\"\\\"\\n\\nimport unittest\\n\\n# TODO: Add TestClass1\\n# TODO: Add TestClass2\\n"}}}}
+
+Step 2 - Add first class:
+{{"tool": "filesystem_replace_lines", "args": {{"path": "myfile.py", "start_line": 6, "end_line": 6, "replacement": "class TestClass1(unittest.TestCase):\\n    def test_example(self):\\n        self.assertTrue(True)\\n\\n# TODO: Add TestClass2"}}}}
+
+Step 3 - Add second class:
+{{"tool": "filesystem_replace_lines", "args": {{"path": "myfile.py", "start_line": 10, "end_line": 10, "replacement": "class TestClass2(unittest.TestCase):\\n    def test_another(self):\\n        self.assertEqual(1, 1)"}}}}
+
+This approach:
+- Prevents truncation (JSON won't be cut off)  
+- Validates syntax at each step
+- Makes debugging easier if something fails
+- Allows recovery without rewriting everything
+
+🚫 COMMON MISTAKES TO AVOID:
+- DON'T use triple backticks ``` in file content - use actual code
+- DON'T copy-paste markdown code blocks - extract the code only
+- DON'T include line numbers in file content (1|, 2|, etc.)
+- DON'T mix tabs and spaces
+- DON'T forget newlines (\\n) between definitions
+- DON'T write 500+ line files in one call - WILL FAIL
+
+✅ ESCAPE SEQUENCES IN JSON:
+When writing files, remember these escapes:
+- Newline: \\n
+- Tab: \\t  
+- Backslash: \\\\
+- Double quote: \\\"
+- Single quotes don't need escaping in JSON: '
+
 ⚠️ FILE SIZE LIMITS:
-When writing or creating files, keep each file under 200 lines. If a file needs to be larger:
-- Write the core/skeleton first with placeholder comments
-- Add functionality in separate tool calls
-- Split large files into multiple smaller modules
-NEVER output a single file with 500+ lines - it will timeout and fail!""".format(tools_text=tools_text)
+When writing or creating files, keep each file under 150 lines in a SINGLE tool call.
+If a file needs to be larger, use the chunked approach above.
+NEVER output a single file with 300+ lines - it will timeout and fail!""".format(tools_text=tools_text)
 
     # Inject user-defined rules
     rules_text = await get_enabled_rules_text(request.workspace_path or "")
@@ -387,7 +639,26 @@ NEVER output a single file with 500+ lines - it will timeout and fail!""".format
         context=context_keywords,
     )
     
-    full_system_prompt = system_prompt + rules_text + memories_text
+    # Feature flag for ReAct loop (gradual rollout)
+    ENABLE_REACT_LOOP = os.getenv("ENABLE_REACT_LOOP", "false").lower() == "true"
+    ENABLE_PROMPT_BUILDER = os.getenv("ENABLE_PROMPT_BUILDER", "false").lower() == "true"
+    ENABLE_TASK_PLANNING = os.getenv("ENABLE_TASK_PLANNING", "false").lower() == "true"
+
+    # Build system prompt (with PromptBuilder if enabled)
+    if ENABLE_PROMPT_BUILDER:
+        prompt_builder = PromptBuilder()
+        task_type = prompt_builder.detect_task_type([msg.model_dump() for msg in request.messages])
+        full_system_prompt = prompt_builder.build(
+            task_type=task_type,
+            model=request.model,
+            tools_description=tools_text,
+            rules_text=rules_text,
+            memories_text=memories_text
+        )
+        logger.info("Using PromptBuilder", task_type=task_type.value)
+    else:
+        # Original prompt building
+        full_system_prompt = system_prompt + rules_text + memories_text
 
     messages_with_system = [{"role": "system", "content": full_system_prompt}]
     messages_with_system.extend([msg.model_dump() for msg in request.messages])
@@ -398,6 +669,40 @@ NEVER output a single file with 500+ lines - it will timeout and fail!""".format
         model=request.model,
         auto_compress=True
     )
+
+    # Task planning phase (if enabled)
+    execution_plan = None
+    if ENABLE_TASK_PLANNING:
+        try:
+            task_planner = TaskPlannerService(model_router=model_router)
+
+            # Get user's task from last message
+            user_task = request.messages[-1].content if request.messages else ""
+
+            # Analyze complexity
+            complexity = await task_planner.analyze_complexity(user_task)
+
+            # Create execution plan
+            execution_plan = await task_planner.create_plan(
+                task=user_task,
+                complexity=complexity,
+                context={"workspace_path": request.workspace_path}
+            )
+
+            logger.info(
+                "Task plan created",
+                plan_id=execution_plan.plan_id,
+                complexity=complexity.value,
+                steps=len(execution_plan.steps),
+                approval_required=execution_plan.approval_required
+            )
+
+            # TODO: Send plan to frontend and wait for approval if needed
+            # For now, just log it
+
+        except Exception as e:
+            logger.error("Task planning failed", error=str(e))
+            execution_plan = None
 
     async def event_generator():
         """Multi-turn conversation loop that continues until model is done."""
@@ -435,11 +740,21 @@ NEVER output a single file with 500+ lines - it will timeout and fail!""".format
         # Track stream retries to prevent infinite retry loops
         empty_stream_retries = 0
         max_empty_stream_retries = 3  # Max consecutive empty streams before giving up
+        
+        # CRITICAL: Track syntax errors to detect fix loops
+        # If agent keeps generating syntax errors for the same file, we need to intervene
+        syntax_error_counts: dict[str, int] = {}  # path -> count of syntax errors
+        max_syntax_errors_per_file = 3  # After this many, provide detailed guidance
+        total_syntax_errors = 0  # Total across all files
+        max_total_syntax_errors = 8  # Abort if too many syntax errors overall
+        last_syntax_error_file: str | None = None  # Track last file with syntax error
+        consecutive_syntax_errors = 0  # Track consecutive syntax errors (reset on success)
 
         # Helper to execute a single tool and yield results
         async def execute_and_yield_tool(tool_call: dict) -> tuple[str, dict, str, dict]:
             """Execute a tool call and yield results to frontend. Returns (result_text, result_dict)."""
             nonlocal completed_edits, read_only_operations, edit_operations, files_read, file_read_attempts, total_blocked_reads, consecutive_blocked_reads
+            nonlocal syntax_error_counts, total_syntax_errors, last_syntax_error_file, consecutive_syntax_errors
             
             tool_name = tool_call.get("tool")
             args = tool_call.get("args", {})
@@ -556,6 +871,41 @@ Example:
             # Reset consecutive blocked reads on successful tool execution (agent made progress)
             if result.get("success") and not result.get("blocked"):
                 consecutive_blocked_reads = 0
+                consecutive_syntax_errors = 0  # Also reset syntax error streak
+            
+            # CRITICAL: Track syntax errors to detect infinite fix loops
+            if result.get("syntax_error"):
+                file_path = args.get("path", "unknown")
+                syntax_error_counts[file_path] = syntax_error_counts.get(file_path, 0) + 1
+                total_syntax_errors += 1
+                consecutive_syntax_errors += 1
+                last_syntax_error_file = file_path
+                
+                logger.warning(
+                    "SYNTAX ERROR detected in tool result",
+                    path=file_path,
+                    count_for_file=syntax_error_counts[file_path],
+                    total_errors=total_syntax_errors,
+                    consecutive=consecutive_syntax_errors
+                )
+                
+                # If too many syntax errors for this file, provide detailed guidance
+                if syntax_error_counts[file_path] >= max_syntax_errors_per_file:
+                    result["hint"] = f"""
+🚨 CRITICAL: You have made {syntax_error_counts[file_path]} syntax errors on '{file_path}'!
+
+You are stuck in a loop. STOP and think carefully:
+
+1. Check your INDENTATION - Python uses 4 spaces (NOT tabs)
+2. Check for UNCLOSED brackets (), [], {{}}
+3. Check for UNCLOSED quotes ' or "
+4. Check for MISSING colons after if/for/while/def/class
+5. DO NOT copy-paste markdown code blocks - extract code only
+
+RECOMMENDED: Delete the file and start fresh with a MINIMAL version:
+{{"tool": "filesystem_delete", "args": {{"path": "{file_path}"}}}}
+
+Then write a SMALL skeleton first and build incrementally."""
 
             # Format result text for model
             result_text = f"Tool {tool_name} executed successfully." if result.get("success") else f"Tool {tool_name} failed."
@@ -624,6 +974,98 @@ Example:
 
             return result_text, result, tool_name, args
 
+        # ===== REACT LOOP INTEGRATION =====
+        # Use ReAct executor if enabled, otherwise fall back to original loop
+        if ENABLE_REACT_LOOP:
+            logger.info("Using ReAct execution loop")
+            try:
+                # Initialize ReAct services
+                self_corrector = SelfCorrectorService()
+                react_executor = ReActExecutor(
+                    tool_registry=registry,
+                    self_corrector=self_corrector,
+                    workspace_path=translated_workspace,
+                    max_iterations=max_iterations
+                )
+
+                # Execute using ReAct pattern
+                async for event in react_executor.execute(
+                    messages=current_messages,
+                    model_router=model_router,
+                    model=request.model,
+                    plan=execution_plan
+                ):
+                    # Convert ReAct events to frontend format
+                    if event.get("type") == "thought":
+                        thought_data = json.dumps({
+                            "type": "react_thought",
+                            "iteration": event.get("iteration"),
+                            "thought": event.get("thought"),
+                            "reasoning": event.get("reasoning"),
+                            "confidence": event.get("confidence")
+                        })
+                        yield f"data: {thought_data}\n\n"
+
+                    elif event.get("type") == "action":
+                        # Tool execution - use existing execute_and_yield_tool
+                        action_data = json.dumps({
+                            "type": "react_action",
+                            "iteration": event.get("iteration"),
+                            "tool": event.get("tool"),
+                            "args": event.get("args")
+                        })
+                        yield f"data: {action_data}\n\n"
+
+                    elif event.get("type") == "observation":
+                        obs_data = json.dumps({
+                            "type": "react_observation",
+                            "iteration": event.get("iteration"),
+                            "success": event.get("success"),
+                            "interpretation": event.get("interpretation")
+                        })
+                        yield f"data: {obs_data}\n\n"
+
+                    elif event.get("type") == "reflection":
+                        refl_data = json.dumps({
+                            "type": "react_reflection",
+                            "iteration": event.get("iteration"),
+                            "assessment": event.get("assessment"),
+                            "should_continue": event.get("should_continue")
+                        })
+                        yield f"data: {refl_data}\n\n"
+
+                    elif event.get("type") == "loop_detected":
+                        loop_data = json.dumps({
+                            "type": "loop_warning",
+                            "loop_type": event.get("loop_type"),
+                            "severity": event.get("severity"),
+                            "suggestion": event.get("suggestion"),
+                            "evidence": event.get("evidence")
+                        })
+                        yield f"data: {loop_data}\n\n"
+
+                    elif event.get("type") == "execution_summary":
+                        summary_data = json.dumps({
+                            "type": "task_complete",
+                            "iterations": event.get("iterations"),
+                            "success_rate": event.get("self_corrector_summary", {}).get("successful_actions", 0) / max(event.get("total_actions", 1), 1),
+                            "total_actions": event.get("total_actions")
+                        })
+                        yield f"data: {summary_data}\n\n"
+
+                logger.info("ReAct execution completed successfully")
+                return
+
+            except Exception as e:
+                logger.error("ReAct execution failed, falling back to original loop", error=str(e))
+                error_data = json.dumps({
+                    "type": "react_error",
+                    "error": f"ReAct loop failed: {str(e)}. Falling back to original loop."
+                })
+                yield f"data: {error_data}\n\n"
+                # Continue to original loop below
+
+        # ===== ORIGINAL LOOP (DEFAULT) =====
         try:
             while iteration < max_iterations:
                 iteration += 1
@@ -642,6 +1084,26 @@ Example:
                                  f"Files: {list(file_read_attempts.keys())[:5]}",
                         "type": "read_loop_detected",
                         "blocked_reads": total_blocked_reads
+                    })
+                    yield f"data: {abort_data}\n\n"
+                    break
+                
+                # SAFETY: Abort if too many syntax errors (agent stuck in fix loop)
+                if total_syntax_errors >= max_total_syntax_errors:
+                    logger.error(
+                        "ABORTING: Agent stuck in syntax error loop!",
+                        total_errors=total_syntax_errors,
+                        files_with_errors=list(syntax_error_counts.keys()),
+                        iteration=iteration
+                    )
+                    abort_data = json.dumps({
+                        "error": f"Agent stuck in syntax error loop: {total_syntax_errors} syntax errors across files. "
+                                 f"The agent keeps generating broken Python code. "
+                                 f"Try a simpler approach or break the task into smaller steps. "
+                                 f"Files with errors: {list(syntax_error_counts.keys())[:3]}",
+                        "type": "syntax_loop_detected",
+                        "syntax_errors": total_syntax_errors,
+                        "files": dict(list(syntax_error_counts.items())[:5])
                     })
                     yield f"data: {abort_data}\n\n"
                     break
@@ -714,6 +1176,10 @@ Example:
                 last_progress_update = 0
                 last_file_preview_update = 0
                 last_preview_content_length = 0
+                
+                # CRITICAL: Save preview content for fallback tool execution
+                # This is used when JSON parsing fails but we successfully extracted content during streaming
+                preview_content_cache = []  # List[Dict[str, Any]] to support multiple tool calls in one turn
                 
                 async for chunk in model_router.stream(
                     model=request.model,
@@ -967,6 +1433,23 @@ Example:
                                         language=language,
                                         chunks=chunks_received
                                     )
+                                    
+                                    # CRITICAL: Save to cache for fallback tool execution
+                                    # Use a list to support multiple tool calls for the same file in one response
+                                    found_entry = False
+                                    if preview_content_cache:
+                                        last_entry = preview_content_cache[-1]
+                                        if last_entry.get("path") == file_path and last_entry.get("tool") == detected_tool_in_progress:
+                                            last_entry["content"] = partial_content
+                                            found_entry = True
+                                    
+                                    if not found_entry:
+                                        preview_content_cache.append({
+                                            "path": file_path,
+                                            "content": partial_content,
+                                            "tool": detected_tool_in_progress
+                                        })
+                                    
                                     file_preview = json.dumps({
                                         "file_write_preview": {
                                             "path": file_path,
@@ -1274,6 +1757,17 @@ Example:
                         if start >= buffer_start_pos:
                             has_tool_in_buffer = True
                             tool_ranges.append((start - buffer_start_pos, end - buffer_start_pos))
+                            
+                            # !! CRITICAL FIX: Add these tool calls to tool_calls_found !!
+                            # This was the bug - tool calls in the final buffer were detected but never executed!
+                            tool_signature = json.dumps(tool_call, sort_keys=True)
+                            if tool_signature not in processed_tool_signatures:
+                                processed_tool_signatures.add(tool_signature)
+                                logger.info("Tool call found in final buffer (will be executed)", tool=tool_call.get("tool"))
+                                tool_calls_found.append({
+                                    "call": tool_call,
+                                    "signature": tool_signature
+                                })
 
                     if has_tool_in_buffer:
                         # Extract only the non-tool parts of the buffer
@@ -1319,6 +1813,82 @@ Example:
                         response_preview=accumulated_response[:500] if accumulated_response else "empty",
                         reasoning_preview=accumulated_reasoning[:500] if accumulated_reasoning else "empty"
                     )
+                
+                # CRITICAL FALLBACK: Check if any previewed files are MISSING from extracted tool calls
+                # This handles the case where filesystem_write JSON parsing fails but shell_execute succeeds
+                if preview_content_cache:
+                    # Map of (path, tool) -> count to track multiple calls for same file/tool
+                    extracted_tool_counts = {}
+                    for tc in tool_calls_found:
+                        call = tc.get("call", {})
+                        tool_name = call.get("tool", "")
+                        path = call.get("args", {}).get("path", "")
+                        if path and tool_name:
+                            key = (path, tool_name)
+                            extracted_tool_counts[key] = extracted_tool_counts.get(key, 0) + 1
+                    
+                    # Track what we've synthesized
+                    synthesized_tool_counts = {}
+                    
+                    for cache_data in preview_content_cache:
+                        path = cache_data.get("path")
+                        tool_name = cache_data.get("tool", "filesystem_write")
+                        content = cache_data.get("content", "")
+                        
+                        if not path or not content or len(content) < 50:
+                            continue
+                            
+                        key = (path, tool_name)
+                        extracted_count = extracted_tool_counts.get(key, 0)
+                        synthesized_count = synthesized_tool_counts.get(key, 0)
+                        
+                        # If we have more cached entries than extracted ones, synthesize the missing ones
+                        if synthesized_count + extracted_count < 1: # Basic case: missing entirely
+                            # For now, just synthesize if completely missing to be safe
+                            # In the future we could do synthesized_count + extracted_count < total_cached_count
+                            logger.warning(
+                                "CRITICAL: Previewed tool call missing from extracted list! Creating synthetic call.",
+                                tool=tool_name,
+                                path=path,
+                                content_len=len(content)
+                            )
+                            
+                            # Create a synthetic tool call from the cached preview
+                            synthetic_tool_call = {
+                                "tool": tool_name,
+                                "args": {"path": path, "content": content}
+                            }
+                            # Add replacement-specific args for replace tools
+                            if tool_name == "filesystem_replace_lines":
+                                # If it's a replacement but we don't have lines, check if it looks like a full file
+                                if content.startswith("#!") or "import " in content:
+                                    # Full file write masquerading as replace
+                                    synthetic_tool_call["args"]["start_line"] = 1
+                                    synthetic_tool_call["args"]["end_line"] = 9999
+                                else:
+                                    # It's a fragment, but we don't know where it goes. 
+                                    # THIS IS DANGEROUS. Let's try to search for where it might go?
+                                    # For now, let's just NOT synthesize partial replaces as full files.
+                                    logger.error("Refusing to synthesize partial replacement as full file write", path=path)
+                                    continue
+                                synthetic_tool_call["args"]["replacement"] = content
+                                if "content" in synthetic_tool_call["args"]:
+                                    del synthetic_tool_call["args"]["content"]
+                            
+                            tool_signature = json.dumps(synthetic_tool_call, sort_keys=True)
+                            if tool_signature not in processed_tool_signatures:
+                                processed_tool_signatures.add(tool_signature)
+                                tool_calls_found.append({
+                                    "call": synthetic_tool_call,
+                                    "signature": tool_signature
+                                })
+                                synthesized_tool_counts[key] = synthesized_count + 1
+                                logger.info(
+                                    "Created SYNTHETIC tool call from preview cache (JSON parse failed)",
+                                    tool=tool_name,
+                                    path=path,
+                                    content_length=len(content)
+                                )
 
                 # ========== HANDLE STREAM TIMEOUT/FAILURE ==========
                 # If we didn't receive any chunks, the stream likely timed out or failed silently
@@ -1804,5 +2374,73 @@ MAKE THE EDIT NOW. NO MORE EXPLANATIONS."""
             logger.exception("Error in event generator")
             error_data = json.dumps({"error": str(e)})
             yield f"data: {error_data}\n\n"
+            
+            # CRITICAL: Even on error, try to write any previewed files
+            # This ensures files shown to user actually get written
+            if preview_content_cache:
+                logger.warning("Writing previewed files on error cleanup", 
+                              count=len(preview_content_cache))
+                for cache_data in preview_content_cache:
+                    try:
+                        path = cache_data.get("path")
+                        content = cache_data.get("content", "")
+                        if content and path and len(content) > 100:  # Only if substantial content
+                            translated_workspace = translate_host_path_to_container(
+                                request.workspace_path or settings.workspace_path
+                            )
+                            mcp_tools_cleanup = MCPTools(translated_workspace)
+                            result = mcp_tools_cleanup.filesystem_write(path, content)
+                            logger.info("Emergency file write on cleanup", path=path, 
+                                       success=result.get("success"), content_len=len(content))
+                    except Exception as write_err:
+                        logger.error("Failed emergency file write", error=str(write_err))
+        finally:
+            # FINAL SAFETY NET: Write any previewed files that weren't executed as tool calls
+            # This handles cases where stream completes but tool parsing failed silently
+            try:
+                if preview_content_cache:
+                    logger.info("Final cleanup: checking for unwritten previewed files",
+                               count=len(preview_content_cache))
+                    for cache_data in preview_content_cache:
+                        path = cache_data.get("path")
+                        content = cache_data.get("content", "")
+                        # Only write if substantial content and file doesn't exist with same content
+                        if content and path and len(content) > 100:
+                            translated_workspace = translate_host_path_to_container(
+                                request.workspace_path or settings.workspace_path
+                            )
+                            full_path = Path(translated_workspace) / path
+                            
+                            # Check if file already exists with this content (was written by tool)
+                            should_write = True
+                            if full_path.exists():
+                                try:
+                                    existing_content = full_path.read_text()
+                                    if existing_content == content:
+                                        should_write = False
+                                        logger.debug("File already written correctly", path=path)
+                                except Exception:
+                                    pass  # If we can't read, try to write anyway
+                            
+                            if should_write:
+                                mcp_tools_cleanup = MCPTools(translated_workspace)
+                                result = mcp_tools_cleanup.filesystem_write(path, content)
+                                if result.get("success"):
+                                    logger.info("Final cleanup: wrote previewed file", 
+                                               path=path, content_len=len(content))
+                                    # Notify frontend
+                                    cleanup_notification = json.dumps({
+                                        "file_write_complete": {
+                                            "tool": "filesystem_write",
+                                            "path": path,
+                                            "action": "created" if not full_path.exists() else "updated",
+                                            "verified": True,
+                                            "success": True,
+                                            "source": "cleanup"
+                                        }
+                                    })
+                                    yield f"data: {cleanup_notification}\n\n"
+            except Exception as cleanup_err:
+                logger.error("Final cleanup failed", error=str(cleanup_err))
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
