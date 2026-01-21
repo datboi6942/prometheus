@@ -980,10 +980,12 @@ Example:
                             auto_prune=True,
                             keep_last=5
                         )
-                        logger.info("Created incremental checkpoint", 
-                                   checkpoint_id=checkpoint_id, 
-                                   successful_tools=successful_tool_count,
-                                   files=len(modified_files))
+                        logger.info("Created incremental checkpoint",
+                                    checkpoint_id=checkpoint_id, 
+                                    successful_tools=successful_tool_count,
+                                    files=len(modified_files))
+                        # Clear modified files for next incremental checkpoint
+                        modified_files.clear()
                     except Exception as e:
                         logger.error("Failed to create incremental checkpoint", error=str(e))
 
